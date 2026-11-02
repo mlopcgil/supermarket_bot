@@ -1,0 +1,1 @@
+Aquí irán los conectores de fuentes verificadas. No se incluyen endpoints no documentados ni scrapers que finjan cobertura. Cada adaptador debe producir filas para `import_prices.py` o escribir en el mismo esquema normalizado.

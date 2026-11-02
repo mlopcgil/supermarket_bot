@@ -46,7 +46,7 @@ def compare_shopping_list(items, stores, queried):
 def format_comparison(result):
     lines = ["🛒 *Comparativa de tu lista*"]
     for item in result["items"]:
-        lines.append(f"\\n*{item['query']}*")
+        lines.append(f"\n*{item['query']}*")
         if not item["store_prices"]:
             lines.append("  No hay precios recientes disponibles para este producto.")
             continue
@@ -55,10 +55,10 @@ def format_comparison(result):
             age = p["captured_at"].strftime("%d/%m/%Y") if hasattr(p["captured_at"], "strftime") else str(p["captured_at"])
             lines.append(f"  • {store}: {p['unit_price']:.2f} €{unit} — dato {age}")
         if item["cheapest"]:
-            lines.append(f"   Más barato: *{item['cheapest']}*")
+            lines.append(f"  Más barato: *{item['cheapest']}*")
         if item["savings"] is not None:
-            lines.append(f"   Diferencia entre más caro y más barato: {item['savings']:.2f} €")
-    lines.append("\\n*Coste total por supermercado*")
+            lines.append(f"  Diferencia entre más caro y más barato: {item['savings']:.2f} €")
+    lines.append("\n*Coste total por supermercado*")
     for store, data in sorted(result["totals"].items(), key=lambda kv: kv[1]["total"]):
         if data["found"] == result["item_count"]:
             lines.append(f"  • {store}: *{data['total']:.2f} €* (lista completa)")
@@ -67,8 +67,8 @@ def format_comparison(result):
         else:
             lines.append(f"  • {store}: sin precios para la lista")
     if result["best_total"]:
-        lines.append(f"\\n *Menor coste para toda la lista: {result['best_total']}*")
+        lines.append(f"\n🏆 *Menor coste para toda la lista: {result['best_total']}*")
     else:
-        lines.append("\\nNo hay un supermercado con precios disponibles para todos los productos; no comparo totales incompletos como si fueran equivalentes.")
-    lines.append("\\nFuente de datos y fecha indicadas por producto. La disponibilidad y el precio final pueden variar por zona.")
-    return "\\n".join(lines)
+        lines.append("\nNo hay un supermercado con precios disponibles para todos los productos; no comparo totales incompletos como si fueran equivalentes.")
+    lines.append("\nFuente de datos y fecha indicadas por producto. La disponibilidad y el precio final pueden variar por zona.")
+    return "\n".join(lines)

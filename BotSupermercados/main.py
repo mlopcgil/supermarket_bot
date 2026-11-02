@@ -24,7 +24,7 @@ bot = telebot.TeleBot(TOKEN, threaded=False)
 app = Flask(__name__)
 init_db()
 
-# Estado conversacional sencillo en memoria; las preferencias permanentes sí están en PostgreSQL.
+# Estado conversacional sencillo en memoria
 pending = {}
 SUPERMARKET_NAMES = ["Mercadona", "Carrefour", "Lidl", "DIA", "Alcampo"]
 
@@ -33,6 +33,12 @@ def user_id(message):
 
 def ensure(message):
     ensure_user(user_id(message), message.from_user.username, message.from_user.first_name)
+
+def get_main_keyboard():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("Comparar lista", "Mis Supermercados")
+    markup.row("Configurar CP", "Ayuda")
+    return markup
 
 def supermarkets_markup(selected=None):
     selected = set(selected or [])
@@ -43,7 +49,7 @@ def supermarkets_markup(selected=None):
             mark = "✅" if name in selected else "⬜"
             row.append(types.InlineKeyboardButton(f"{mark} {name}", callback_data=f"pref:{name}"))
         markup.row(*row)
-    markup.row(types.InlineKeyboardButton("💾 Guardar preferencias", callback_data="pref:save"))
+    markup.row(types.InlineKeyboardButton("Guardar preferencias", callback_data="pref:save"))
     return markup
 
 @bot.message_handler(commands=["start", "help"])
@@ -51,23 +57,23 @@ def start(message):
     ensure(message)
     bot.send_message(
         message.chat.id,
-        "🛒 *Tu comparador de supermercados*\\n\\n"
-        "Envíame una lista como:\\n`yogures naturales, manzanas, leche semidesnatada`\\n\\n"
-        "Comandos:\\n"
-        "/supermercados — elegir tus tiendas habituales\\n"
-        "/cp — configurar código postal\\n"
-        "/comparar — enviar una lista de compra\\n"
-        "/ayuda — ver ayuda\\n\\n"
-        "Compararé solo precios cargados desde una fuente real y mostraré su fecha. "
-        "No inventaré precios ni equivalencias.",
-        parse_mode="Markdown"
+        "🛒 *Tu comparador de supermercados*\n\n"
+        "Puedes usar los botones de abajo o enviarme directamente tu lista de la compra:\n"
+        "`yogur, manzanas, huevos, leche`\n\n"
+        "Comandos y accesos rápidos:\n"
+        "• *Comparar lista*: enviar tu lista de la compra\n"
+        "• *Mis Supermercados*: elegir tus tiendas habituales\n"
+        "• *Configurar CP*: guardar tu código postal\n"
+        "• *Ayuda*: ver estas instrucciones",
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard()
     )
 
-@bot.message_handler(commands=["ayuda"])
+@bot.message_handler(func=lambda m: m.text == "Ayuda" or m.text == "/ayuda")
 def help_command(message):
     start(message)
 
-@bot.message_handler(commands=["supermercados"])
+@bot.message_handler(func=lambda m: m.text == "Mis Supermercados" or m.text == "/supermercados")
 def preferences(message):
     ensure(message)
     selected = get_user_supermarkets(user_id(message))
@@ -89,7 +95,7 @@ def preference_callback(call):
         bot.answer_callback_query(call.id, "Preferencias guardadas")
         bot.edit_message_text(
             "Preferencias guardadas: " + (", ".join(chosen) if chosen else "ningún supermercado seleccionado") +
-            "\\nPuedes cambiarlas cuando quieras con /supermercados.",
+            "\nPuedes cambiarlas cuando quieras con el botón 🏪 Mis Supermercados.",
             call.message.chat.id, call.message.message_id
         )
         return
@@ -102,44 +108,53 @@ def preference_callback(call):
     bot.answer_callback_query(call.id)
     bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=supermarkets_markup(selected))
 
-@bot.message_handler(commands=["cp"])
+@bot.message_handler(func=lambda m: m.text == "Configurar CP" or m.text.startswith("/cp"))
 def postal_code(message):
     ensure(message)
     parts = message.text.split(maxsplit=1)
     if len(parts) == 2 and parts[1].strip().isdigit() and len(parts[1].strip()) == 5:
         set_postal_code(user_id(message), parts[1].strip())
-        bot.reply_to(message, "Código postal guardado. Se usará para filtrar datos zonales cuando la fuente lo permita.")
+        bot.reply_to(message, "Código postal guardado correctamente.", reply_markup=get_main_keyboard())
     else:
-        bot.reply_to(message, "Indica tu código postal así: `/cp 28001`", parse_mode="Markdown")
+        msg = bot.send_message(message.chat.id, "Escribe tu código postal (ejemplo: 28001):")
+        bot.register_next_step_handler(msg, process_cp)
 
-@bot.message_handler(commands=["comparar"])
+def process_cp(message):
+    ensure(message)
+    cp = (message.text or "").strip()
+    if cp.isdigit() and len(cp) == 5:
+        set_postal_code(user_id(message), cp)
+        bot.send_message(message.chat.id, f"Código postal {cp} guardado.", reply_markup=get_main_keyboard())
+    else:
+        bot.send_message(message.chat.id, "Código postal no válido. Debe tener 5 dígitos (ejemplo: 28001).", reply_markup=get_main_keyboard())
+
+@bot.message_handler(func=lambda m: m.text == "Comparar lista" or m.text == "/comparar")
 def compare_command(message):
     ensure(message)
-    msg = bot.send_message(message.chat.id, "Escribe los productos separados por comas o uno por línea.")
+    msg = bot.send_message(message.chat.id, "Escribe los productos de tu lista separados por comas o saltos de línea (ej: yogur, manzanas, huevos):")
     bot.register_next_step_handler(msg, process_list)
 
 def process_list(message):
     ensure(message)
     items = parse_list(message.text or "")
     if not items:
-        bot.reply_to(message, "No he detectado productos. Prueba: `yogures, manzanas, leche`", parse_mode="Markdown")
+        bot.reply_to(message, "No he detectado productos. Prueba a escribir: `yogur, manzanas, huevos`", parse_mode="Markdown", reply_markup=get_main_keyboard())
         return
     uid = user_id(message)
     preferred = get_user_supermarkets(uid)
     if not preferred:
-        bot.send_message(message.chat.id, "Primero elige tus supermercados habituales con /supermercados. También puedes escribir /supermercados ahora y volver a enviar la lista.")
+        bot.send_message(message.chat.id, "Primero elige tus supermercados habituales pulsando en 🏪 Mis Supermercados.", reply_markup=get_main_keyboard())
         return
-    # Permite añadir tiendas solo a esta compra, sin cambiar preferencias guardadas.
     markup = types.InlineKeyboardMarkup(row_width=2)
     for name in SUPERMARKET_NAMES:
         if name not in preferred:
             markup.add(types.InlineKeyboardButton(f"+ {name} solo esta compra", callback_data=f"extra:{name}"))
-    markup.add(types.InlineKeyboardButton("Comparar ahora", callback_data="run:"))
+    markup.add(types.InlineKeyboardButton("Comparar precios ahora", callback_data="run:"))
     pending[uid] = {"mode": "shopping", "items": items, "stores": list(preferred)}
     bot.send_message(
         message.chat.id,
-        "Lista: " + ", ".join(items) + "\\n\\nTiendas habituales: " + ", ".join(preferred) +
-        "\\nPuedes añadir supermercados solo para esta compra o comparar ahora.",
+        "Lista: " + ", ".join(items) + "\n\nTiendas habituales: " + ", ".join(preferred) +
+        "\nPuedes añadir algún supermercado extra solo para esta compra o pulsar en comparar:",
         reply_markup=markup
     )
 
@@ -156,25 +171,25 @@ def shopping_callback(call):
             state["stores"].append(name)
         bot.answer_callback_query(call.id, f"{name} añadido solo a esta compra")
         bot.edit_message_text(
-            "Lista: " + ", ".join(state["items"]) + "\\nTiendas para esta compra: " + ", ".join(state["stores"]) +
-            "\\n\\nPulsa comparar cuando estés listo.",
+            "Lista: " + ", ".join(state["items"]) + "\nTiendas para esta compra: " + ", ".join(state["stores"]) +
+            "\n\nPulsa el botón cuando estés listo.",
             call.message.chat.id, call.message.message_id,
             reply_markup=types.InlineKeyboardMarkup().add(
-                types.InlineKeyboardButton("Comparar ahora", callback_data="run:")
+                types.InlineKeyboardButton("Comparar precios ahora", callback_data="run:")
             )
         )
         return
-    bot.answer_callback_query(call.id, "Consultando precios…")
+    bot.answer_callback_query(call.id, "Consultando precios en tiempo real…")
     items, stores = state["items"], state["stores"]
     try:
         prices = get_prices_for_query(items, stores, get_postal_code(uid))
         result = compare_shopping_list(items, stores, prices)
         save_session(uid, items, stores, result)
         text = format_comparison(result)
-        bot.send_message(call.message.chat.id, text, disable_web_page_preview=True)
+        bot.send_message(call.message.chat.id, text, disable_web_page_preview=True, parse_mode="Markdown", reply_markup=get_main_keyboard())
     except Exception:
         log.exception("Error comparando lista")
-        bot.send_message(call.message.chat.id, "No he podido completar la comparación. Revisa los logs y vuelve a intentarlo.")
+        bot.send_message(call.message.chat.id, "No he podido completar la comparación. Inténtalo de nuevo en unos momentos.", reply_markup=get_main_keyboard())
     finally:
         pending.pop(uid, None)
 

@@ -12,26 +12,22 @@ def norm(text):
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text)).strip()
 
 def search_mercadona(query, zip_code="28001"):
-    """
-    Mercadona API pública de búsqueda de productos
-    URL: https://api.mercadona.com/api/v1_1/search/
-    """
     url = "https://api.mercadona.com/api/v1_1/search/"
     params = {"q": query, "limit": 10}
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json"
     }
     results = []
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=5)
+        resp = requests.get(url, params=params, headers=headers, timeout=8)
         if resp.status_code == 200:
             data = resp.json()
             products = data.get("results", [])
             today = date.today().isoformat()
             for p in products:
-                price_instructions = p.get("price_instructions", {})
-                unit_price = price_instructions.get("unit_price")
+                price_instructions = p.get("price_instructions", {}) or {}
+                unit_price = price_instructions.get("unit_price") or price_instructions.get("bulk_price")
                 if unit_price is None:
                     continue
                 name = p.get("display_name") or p.get("title") or ""
@@ -53,27 +49,26 @@ def search_mercadona(query, zip_code="28001"):
     return results
 
 def search_dia(query, zip_code="28001"):
-    """
-    DIA API pública de búsqueda
-    URL: https://www.dia.es/api/v1/search
-    """
-    url = "https://www.dia.es/api/v1/search"
+    url = f"https://www.dia.es/api/v1/search-back/search/products"
     params = {"q": query, "page": 1}
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json"
     }
     results = []
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=5)
+        resp = requests.get(url, params=params, headers=headers, timeout=8)
+        if resp.status_code != 200:
+            url_alt = "https://www.dia.es/api/v1/search"
+            resp = requests.get(url_alt, params=params, headers=headers, timeout=8)
         if resp.status_code == 200:
             data = resp.json()
-            search_result = data.get("search_result", []) or data.get("products", [])
+            items = data.get("search_result", []) or data.get("products", []) or data.get("items", [])
             today = date.today().isoformat()
-            for p in search_result:
-                name = p.get("name") or p.get("display_name") or ""
-                prices = p.get("prices", {})
-                price = prices.get("price") or p.get("price")
+            for p in items:
+                name = p.get("name") or p.get("display_name") or p.get("title") or ""
+                prices = p.get("prices", {}) or {}
+                price = prices.get("price") or p.get("price") or prices.get("strikethrough_price")
                 if price is None:
                     continue
                 results.append({
@@ -94,9 +89,6 @@ def search_dia(query, zip_code="28001"):
     return results
 
 def search_carrefour(query, zip_code="28001"):
-    """
-    Carrefour API / Search endpoint
-    """
     url = "https://www.carrefour.es/cloud-api/v1/search"
     params = {"query": query, "offset": 0, "limit": 10}
     headers = {
@@ -105,7 +97,7 @@ def search_carrefour(query, zip_code="28001"):
     }
     results = []
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=5)
+        resp = requests.get(url, params=params, headers=headers, timeout=8)
         if resp.status_code == 200:
             data = resp.json()
             items = data.get("docs", []) or data.get("content", {}).get("docs", [])
@@ -133,9 +125,6 @@ def search_carrefour(query, zip_code="28001"):
     return results
 
 def search_alcampo(query, zip_code="28001"):
-    """
-    Alcampo (Compra Online) API Search
-    """
     url = "https://www.compraonline.alcampo.es/api/v1/products/search"
     params = {"term": query, "limit": 10}
     headers = {
@@ -144,7 +133,7 @@ def search_alcampo(query, zip_code="28001"):
     }
     results = []
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=5)
+        resp = requests.get(url, params=params, headers=headers, timeout=8)
         if resp.status_code == 200:
             data = resp.json()
             products = data.get("products", []) or data.get("entities", [])
@@ -172,9 +161,6 @@ def search_alcampo(query, zip_code="28001"):
     return results
 
 def fetch_live_prices(query, stores, zip_code="28001"):
-    """
-    Busca en tiempo real en las APIs de los supermercados seleccionados.
-    """
     all_results = []
     for store in stores:
         store_lower = store.lower()

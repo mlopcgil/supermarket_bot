@@ -175,38 +175,30 @@ def get_prices_for_query(items, stores, postal_code=None):
     result = []
     for query in items:
         q = norm(query)
-        terms = [t for t in q.split() if len(t) > 2]
+        terms = [t for t in q.split() if len(t) > 1]
         matches = []
         for row in rows:
             n = row["normalized_name"] or norm(row["name"])
-            if q == n or (terms and all(t in n for t in terms)):
+            # Puntuación por número de palabras clave que coinciden
+            score = sum(1 for t in terms if t in n)
+            if score > 0 or q in n or n in q:
                 item = dict(row)
                 item["unit_price"] = float(item["unit_price"]) if item["unit_price"] is not None else None
+                item["_match_score"] = score + (5 if q in n else 0)
                 matches.append(item)
-        # Keep latest price per supermarket/name for this query
-        newest = {}
+        
+        # Seleccionar el producto de mayor puntuación y más reciente por supermercado
+        best_by_store = {}
         for item in matches:
-            key = (item["supermarket"], item["normalized_name"])
-            if key not in newest or item["captured_at"] > newest[key]["captured_at"]:
-                newest[key] = item
-        # Preferir un grupo explícitamente equivalente (canonical_key). Sin clave,
-        # solo se consideran equivalentes nombres normalizados idénticos.
-        groups = {}
-        for item in newest.values():
-            group_key = item.get("canonical_key") or item["normalized_name"]
-            groups.setdefault(group_key, []).append(item)
-        if groups:
-            # Elegir el grupo que cubre más supermercados; desempate por frescura.
-            selected = sorted(
-                groups.values(),
-                key=lambda group: (
-                    len({x["supermarket"] for x in group}),
-                    max(x["captured_at"] for x in group)
-                ),
-                reverse=True
-            )[0]
-        else:
-            selected = []
+            s_name = item["supermarket"]
+            if s_name not in best_by_store:
+                best_by_store[s_name] = item
+            else:
+                current = best_by_store[s_name]
+                if (item["_match_score"], item["captured_at"]) > (current["_match_score"], current["captured_at"]):
+                    best_by_store[s_name] = item
+
+        selected = list(best_by_store.values())
         result.append({"query": query, "prices": selected})
     return result
 

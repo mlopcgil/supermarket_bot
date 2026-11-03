@@ -26,7 +26,7 @@ init_db()
 
 # Estado conversacional sencillo en memoria
 pending = {}
-SUPERMARKET_NAMES = ["Mercadona", "Carrefour", "Lidl", "DIA", "Alcampo"]
+SUPERMARKET_NAMES = ["Mercadona", "Carrefour", "Lidl", "DIA", "Alcampo", "Aldi", "Eroski", "Ahorramás"]
 
 def user_id(message):
     return message.from_user.id
@@ -141,6 +141,14 @@ def process_list(message):
         bot.reply_to(message, "No he detectado productos. Prueba a escribir: `yogur, manzanas, huevos`", parse_mode="Markdown", reply_markup=get_main_keyboard())
         return
     uid = user_id(message)
+    postal_code = get_postal_code(uid)
+    if not postal_code:
+        bot.send_message(
+            message.chat.id,
+            "Antes de comparar necesito tu código postal. Configúralo con el botón 📍 Configurar CP o con /cp 28001.",
+            reply_markup=get_main_keyboard()
+        )
+        return
     preferred = get_user_supermarkets(uid)
     if not preferred:
         bot.send_message(message.chat.id, "Primero elige tus supermercados habituales pulsando en 🏪 Mis Supermercados.", reply_markup=get_main_keyboard())
@@ -201,7 +209,7 @@ def free_text_list(message):
 def health():
     return "Bot de supermercados funcionando", 200
 
-@app.route(f"/{TOKEN}", methods=["POST"])
+@app.route("/telegram-webhook", methods=["POST"])
 def webhook():
     if request.headers.get("content-type", "").split(";")[0] == "application/json":
         update = telebot.types.Update.de_json(request.get_data().decode("utf-8"))

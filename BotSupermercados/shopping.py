@@ -54,6 +54,14 @@ def format_comparison(result):
             unit = f" ({p['unit']})" if p.get("unit") else ""
             age = p["captured_at"].strftime("%d/%m/%Y") if hasattr(p["captured_at"], "strftime") else str(p["captured_at"])
             lines.append(f"  • {store}: {p['unit_price']:.2f} €{unit} — dato {age}")
+            raw = p.get("raw_data") or {}
+            ref_price = raw.get("reference_price") if isinstance(raw, dict) else None
+            ref_format = raw.get("reference_format") if isinstance(raw, dict) else None
+            if ref_price is not None:
+                try:
+                    lines.append(f"      Referencia: {float(ref_price):.2f} €/" + str(ref_format or "unidad"))
+                except (TypeError, ValueError):
+                    pass
         if item["cheapest"]:
             lines.append(f"  Más barato: *{item['cheapest']}*")
         if item["savings"] is not None:

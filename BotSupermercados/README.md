@@ -11,15 +11,17 @@ Bot independiente basado en la estructura del bot de referencia: `pyTelegramBotA
 - No calcula un total ganador si faltan precios de uno o varios productos.
 - Solo muestra precios importados con fecha reciente (últimos 3 días).
 - Importador CSV de precios verificados.
-- Código postal opcional, respetado cuando el dato importado tiene zona.
+- Código postal obligatorio antes de comparar precios.
+- Conector con la última release pública de OpenCesta (Parquet), con caché local.
+- La cobertura depende de las cadenas y zonas que publique OpenCesta; no se simulan precios de las demás tiendas.
 
 ## Limitación importante sobre los datos
 
-El bot y la base de datos quedan funcionales, pero este repositorio **no trae un recolector automático de los cinco supermercados**. No se inventan endpoints ni precios. Antes de comparar en Telegram, hay que cargar datos reales mediante `import_prices.py` o desarrollar conectores mantenibles para fuentes concretas.
+El conector automático descarga la última release de OpenCesta desde GitHub y consulta su dataset Parquet. Según la documentación pública consultada, actualmente publica Mercadona en zonas concretas, DIA y Ahorramás; no ofrece todavía cobertura completa de Carrefour, Lidl, Aldi, Eroski y Alcampo. Para esas tiendas el bot indicará que no hay datos, en lugar de inventar precios. La disponibilidad exacta depende de la zona publicada y del último snapshot.
 
 Fuentes públicas investigadas como posibles siguientes pasos:
 - CholloSúper publica ficheros abiertos bajo CC BY 4.0, pero su descarga abierta incluye una cesta fija, índice, frescura y bajadas; no equivale a un catálogo completo para responder cualquier lista. Atribución requerida: `Fuente: CholloSúper (chollosuper.com), consultado el [fecha]`.
-- OpenCesta publica un dataset histórico Parquet, pero su README indica cobertura de cadenas y zonas en desarrollo; no debe darse por hecho que hay catálogo actual completo de Mercadona, Carrefour, Lidl, DIA y Alcampo simultáneamente.
+- OpenCesta publica snapshots Parquet diarios. El código resuelve el código postal mediante su CLI `opencesta zone`; si la zona resuelta no está en la release, no consulta una zona distinta.
 - El código postal importa: los precios de algunas cadenas cambian por tienda o zona.
 
 No uses un CSV histórico o una muestra de ejemplo como si fueran precios actuales.
@@ -59,11 +61,11 @@ Esto levanta Flask en el puerto 10000, pero Telegram no podrá enviar webhooks a
 4. El comando de inicio es `gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 4`.
 5. Configura el webhook de Telegram a `https://TU-DOMINIO/TU_TELEGRAM_TOKEN`.
 
-El código expone la ruta `/` como comprobación de salud y `/<TOKEN>` para recibir actualizaciones, siguiendo el patrón del bot original. Usa siempre HTTPS y no publiques el token.
+El código expone la ruta `/` como comprobación de salud y `/telegram-webhook` para recibir actualizaciones. El token ya no forma parte de la URL del webhook. Usa siempre HTTPS y no publiques el token.
 
 Para registrar el webhook una vez desplegado, abre esta URL sustituyendo los valores (no la publiques ni compartas el token):
 
-`https://api.telegram.org/bot<TU_TOKEN>/setWebhook?url=https://<TU-DOMINIO>/<TU_TOKEN>`
+`https://api.telegram.org/bot<TU_TOKEN>/setWebhook?url=https://<TU-DOMINIO>/telegram-webhook`
 
 ## 4. Base de datos
 
@@ -114,3 +116,22 @@ Las preferencias son persistentes. Los supermercados extra se guardan solo en la
 ## Atribución de datos
 
 Si importas datos de CholloSúper, conserva la atribución exigida por su licencia: `Fuente: CholloSúper (chollosuper.com), consultado el [fecha]`. Comprueba siempre las condiciones de reutilización de cualquier otra fuente.
+
+
+## 8. Conector automático OpenCesta
+
+El conector está en `price_sources/api_connectors.py`. Descarga los assets Parquet de la última release de `ruvelro/opencesta`, los guarda en `/tmp/micestita_opencesta` y mantiene una caché en memoria durante 6 horas. El CP se resuelve con `opencesta zone <CP>`; no se convierte por prefijo en una zona inventada.
+
+Variables opcionales:
+
+```env
+OPENCESTA_CACHE_TTL_SECONDS=21600
+OPENCESTA_CACHE_DIR=/tmp/micestita_opencesta
+PRICE_HTTP_TIMEOUT=30
+```
+
+La dependencia `opencesta` se instala desde su subdirectorio `core` mediante `requirements.txt` para disponer del comando `opencesta zone`. Si se despliega en un entorno que no permite instalar dependencias Git, el conector no podrá resolver zonas Mercadona y lo registrará en el log.
+
+**Cobertura y precisión:** OpenCesta publica datos por cadena/zona y fecha. El código postal se utiliza para resolver la zona cuando el adaptador lo permite, pero el precio almacenado se etiqueta como regional (`postal_code = NULL`) porque no es una tarifa individual del domicilio. La fuente, fecha, zona y precio de referencia se conservan en `raw_data`. Las tiendas que no aparezcan en el snapshot no devolverán resultados.
+
+**Importante:** después de actualizar este código, vuelve a configurar el webhook de Telegram con la ruta `/telegram-webhook`. Si el token anterior apareció en logs, revócalo en BotFather y configura el nuevo valor de `TELEGRAM_TOKEN`.

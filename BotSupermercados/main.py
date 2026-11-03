@@ -21,6 +21,20 @@ if not TOKEN:
     raise RuntimeError("Falta TELEGRAM_TOKEN en el entorno/.env")
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
+
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
+if WEBHOOK_URL:
+    webhook_url = WEBHOOK_URL.rstrip("/")
+
+    if not webhook_url.endswith("/telegram-webhook"):
+        raise ValueError("WEBHOOK_URL debe terminar en /telegram-webhook")
+
+    if bot.set_webhook(url=webhook_url):
+        log.info("Webhook configurado correctamente")
+    else:
+        raise RuntimeError("No se pudo configurar el webhook")
+
 app = Flask(__name__)
 init_db()
 

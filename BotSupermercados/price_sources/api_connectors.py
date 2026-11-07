@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tarfile
 import time
+import threading
 import unicodedata
 import zipfile
 from datetime import date
@@ -33,9 +34,15 @@ SESSION.headers.update({
     "User-Agent": os.getenv("PRICE_USER_AGENT", "MiCestita/1.0 price-comparison-bot"),
     "Accept": "application/vnd.github+json, application/octet-stream, */*",
 })
+# GitHub permite más peticiones autenticadas. El token es opcional.
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+if GITHUB_TOKEN:
+    SESSION.headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+
 _FRAME = None
 _FRAME_AT = 0.0
 _FRAME_TAG = None
+_LOAD_LOCK = threading.Lock()
 
 STORE_TO_CHAIN = {
     "mercadona": "mercadona", "dia": "dia", "ahorramas": "ahorramas",
@@ -55,100 +62,168 @@ def _copy(src, dst):
     shutil.copyfileobj(src, dst)
 
 
+def _cached_manifest():
+    """Devuelve (tag, rutas parquet, manifiesto) si la caché local es válida."""
+    manifest_path = CACHE_DIR / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        names = manifest.get("parquet_files") or []
+        paths = []
+        for name in names:
+            candidate = Path(name)
+            # Compatibilidad con el manifiesto antiguo (solo nombre de archivo).
+            path = candidate if candidate.is_absolute() else CACHE_DIR / candidate
+            paths.append(path)
+        if paths and all(path.is_file() and path.stat().st_size > 0 for path in paths):
+            return str(manifest.get("tag") or "cached"), paths, manifest
+    except Exception:
+        log.exception("[OpenCesta] No se pudo leer el manifiesto de caché.")
+    return None
+
+
+def _use_cached_manifest(cached, reason: str):
+    if not cached:
+        return None
+    tag, paths, manifest = cached
+    age = max(0, time.time() - float(manifest.get("downloaded_at", 0)))
+    log.warning(
+        "[OpenCesta] Se reutiliza la caché %s (edad: %.1f horas). Motivo: %s",
+        tag, age / 3600, reason,
+    )
+    return tag, paths
+
+
 def _download_latest_release() -> tuple[str, list[Path]]:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    response = SESSION.get(RELEASES_URL, timeout=TIMEOUT)
-    response.raise_for_status()
-    release = response.json()
-    tag = str(release.get("tag_name") or release.get("name") or "latest")
-    manifest_path = CACHE_DIR / "manifest.json"
-    if manifest_path.exists():
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if manifest.get("tag") == tag and time.time() - manifest.get("downloaded_at", 0) < CACHE_TTL:
-                paths = [CACHE_DIR / n for n in manifest.get("parquet_files", [])]
-                if paths and all(p.exists() for p in paths):
-                    return tag, paths
-        except Exception:
-            log.warning("Caché de OpenCesta inválida; se volverá a descargar.")
 
-    assets = release.get("assets") or []
-    if not assets:
-        raise RuntimeError("La última release de OpenCesta no tiene assets.")
-    archives = []
-    for asset in assets:
-        name, url = asset.get("name", ""), asset.get("browser_download_url")
-        low = name.lower()
-        if not url or not low.endswith((".parquet", ".zip", ".tar.gz", ".tgz")):
-            continue
-        target = CACHE_DIR / name
-        if not target.exists() or target.stat().st_size == 0:
-            log.info("[OpenCesta] Descargando %s", name)
-            with SESSION.get(url, stream=True, timeout=TIMEOUT) as r:
-                r.raise_for_status()
+    # La comprobación local va ANTES de llamar a GitHub: así no se consume
+    # el límite de la API por cada producto de la lista.
+    cached = _cached_manifest()
+    if cached:
+        _, _, manifest = cached
+        age = time.time() - float(manifest.get("downloaded_at", 0))
+        if 0 <= age < CACHE_TTL:
+            log.info("[OpenCesta] Usando caché local vigente (%s).", manifest.get("tag"))
+            return cached[0], cached[1]
+
+    try:
+        response = SESSION.get(RELEASES_URL, timeout=TIMEOUT)
+        response.raise_for_status()
+        release = response.json()
+        tag = str(release.get("tag_name") or release.get("name") or "latest")
+        assets = release.get("assets") or []
+        if not assets:
+            raise RuntimeError("La última release de OpenCesta no tiene assets.")
+
+        # Separar directorios por versión evita reutilizar accidentalmente un
+        # archivo de una release anterior que tenga el mismo nombre.
+        safe_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", tag)[:100] or "latest"
+        release_dir = CACHE_DIR / safe_tag
+        release_dir.mkdir(parents=True, exist_ok=True)
+
+        archives = []
+        for asset in assets:
+            name, url = asset.get("name", ""), asset.get("browser_download_url")
+            low = name.lower()
+            if not url or not low.endswith((".parquet", ".zip", ".tar.gz", ".tgz")):
+                continue
+            target = release_dir / Path(name).name
+            if not target.exists() or target.stat().st_size == 0:
+                log.info("[OpenCesta] Descargando %s", name)
                 tmp = target.with_name(target.name + ".part")
-                with tmp.open("wb") as f:
-                    for chunk in r.iter_content(1024 * 1024):
-                        if chunk:
-                            f.write(chunk)
-                tmp.replace(target)
-        archives.append(target)
+                try:
+                    with SESSION.get(url, stream=True, timeout=TIMEOUT) as r:
+                        r.raise_for_status()
+                        with tmp.open("wb") as f:
+                            for chunk in r.iter_content(1024 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+                    tmp.replace(target)
+                finally:
+                    if tmp.exists():
+                        tmp.unlink()
+            archives.append(target)
 
-    parquet_files = []
-    for archive in archives:
-        low = archive.name.lower()
-        if low.endswith(".parquet"):
-            parquet_files.append(archive)
-        elif low.endswith(".zip"):
-            with zipfile.ZipFile(archive) as zf:
-                for member in zf.infolist():
-                    if member.is_dir() or not member.filename.lower().endswith(".parquet"):
-                        continue
-                    out = CACHE_DIR / f"{archive.stem}_{Path(member.filename).name}"
-                    if not out.exists() or out.stat().st_size == 0:
-                        with zf.open(member) as src, out.open("wb") as dst:
-                            _copy(src, dst)
-                    parquet_files.append(out)
-        else:
-            with tarfile.open(archive, "r:gz") as tf:
-                for member in tf.getmembers():
-                    if not member.isfile() or not member.name.lower().endswith(".parquet"):
-                        continue
-                    src = tf.extractfile(member)
-                    if src is None:
-                        continue
-                    out = CACHE_DIR / f"{archive.stem}_{Path(member.name).name}"
-                    if not out.exists() or out.stat().st_size == 0:
-                        with src, out.open("wb") as dst:
-                            _copy(src, dst)
-                    parquet_files.append(out)
-    if not parquet_files:
-        raise RuntimeError("Los assets de OpenCesta no contienen Parquet reconocible.")
-    manifest_path.write_text(json.dumps({
-        "tag": tag, "downloaded_at": time.time(),
-        "parquet_files": [p.name for p in parquet_files],
-    }), encoding="utf-8")
-    return tag, parquet_files
+        parquet_files = []
+        for archive in archives:
+            low = archive.name.lower()
+            if low.endswith(".parquet"):
+                parquet_files.append(archive)
+            elif low.endswith(".zip"):
+                with zipfile.ZipFile(archive) as zf:
+                    for member in zf.infolist():
+                        if member.is_dir() or not member.filename.lower().endswith(".parquet"):
+                            continue
+                        out = release_dir / f"{archive.stem}_{Path(member.filename).name}"
+                        if not out.exists() or out.stat().st_size == 0:
+                            with zf.open(member) as src, out.open("wb") as dst:
+                                _copy(src, dst)
+                        parquet_files.append(out)
+            else:
+                with tarfile.open(archive, "r:gz") as tf:
+                    for member in tf.getmembers():
+                        if not member.isfile() or not member.name.lower().endswith(".parquet"):
+                            continue
+                        src_file = tf.extractfile(member)
+                        if src_file is None:
+                            continue
+                        out = release_dir / f"{archive.stem}_{Path(member.name).name}"
+                        if not out.exists() or out.stat().st_size == 0:
+                            with src_file, out.open("wb") as dst:
+                                _copy(src_file, dst)
+                        else:
+                            src_file.close()
+                        parquet_files.append(out)
+
+        if not parquet_files:
+            raise RuntimeError("Los assets de OpenCesta no contienen Parquet reconocible.")
+
+        manifest = {
+            "tag": tag,
+            "downloaded_at": time.time(),
+            "parquet_files": [str(path.relative_to(CACHE_DIR)) for path in parquet_files],
+        }
+        manifest_path = CACHE_DIR / "manifest.json"
+        tmp_manifest = manifest_path.with_suffix(".json.part")
+        tmp_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+        tmp_manifest.replace(manifest_path)
+        log.info("[OpenCesta] Release %s descargada; %s Parquet.", tag, len(parquet_files))
+        return tag, parquet_files
+
+    except Exception as exc:
+        # Si GitHub limita la API o falla una descarga, no descartamos los
+        # datos anteriores: se siguen usando aunque hayan superado el TTL.
+        fallback = _use_cached_manifest(cached, str(exc))
+        if fallback:
+            return fallback
+        raise
 
 
 def _load_dataset(force=False):
     global _FRAME, _FRAME_AT, _FRAME_TAG
-    if not force and _FRAME is not None and time.time() - _FRAME_AT < CACHE_TTL:
-        return _FRAME_TAG, _FRAME
-    tag, files = _download_latest_release()
-    frames = []
-    for path in files:
-        try:
-            frames.append(pd.read_parquet(path))
-        except Exception:
-            log.exception("[OpenCesta] Error leyendo %s", path)
-    if not frames:
-        raise RuntimeError("No se pudo leer ningún Parquet. Instala pyarrow.")
-    _FRAME = pd.concat(frames, ignore_index=True, sort=False)
-    _FRAME.columns = [str(c).lower().strip() for c in _FRAME.columns]
-    _FRAME_AT, _FRAME_TAG = time.time(), tag
-    log.info("[OpenCesta] Release %s: %s filas", tag, len(_FRAME))
-    return tag, _FRAME
+    # Evita que varias actualizaciones de Telegram descarguen el dataset a la vez.
+    with _LOAD_LOCK:
+        if not force and _FRAME is not None and time.time() - _FRAME_AT < CACHE_TTL:
+            return _FRAME_TAG, _FRAME
+
+        tag, files = _download_latest_release()
+        frames = []
+        for path in files:
+            try:
+                frames.append(pd.read_parquet(path))
+            except Exception:
+                log.exception("[OpenCesta] Error leyendo %s", path)
+        if not frames:
+            raise RuntimeError("No se pudo leer ningún Parquet. Instala una versión compatible de pyarrow.")
+        frame = pd.concat(frames, ignore_index=True, sort=False)
+        frame.columns = [str(c).lower().strip() for c in frame.columns]
+
+        _FRAME = frame
+        _FRAME_AT, _FRAME_TAG = time.time(), tag
+        log.info("[OpenCesta] Release %s: %s filas", tag, len(_FRAME))
+        return tag, _FRAME
 
 
 _ZONE_CACHE: dict[str, str | None] = {}
@@ -304,4 +379,5 @@ def fetch_live_prices(query: str, stores: list[str], zip_code: str | None = None
 
 def clear_cache():
     global _FRAME, _FRAME_AT, _FRAME_TAG
-    _FRAME, _FRAME_AT, _FRAME_TAG = None, 0.0, None
+    with _LOAD_LOCK:
+        _FRAME, _FRAME_AT, _FRAME_TAG = None, 0.0, None

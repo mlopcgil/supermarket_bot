@@ -7,6 +7,7 @@ JSON-LD. La cobertura es parcial; Lidl alimentación se deja para CSV verificado
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -72,6 +73,10 @@ def _cached_manifest():
         return None
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        # La versión 2 conserva la identidad de cada Parquet dentro del ZIP/TAR.
+        # Los manifiestos antiguos podían apuntar varias veces al mismo archivo.
+        if int(manifest.get("cache_format", 0)) < 2:
+            return None
         names = manifest.get("parquet_files") or []
         paths = [CACHE_DIR / name for name in names]
         if paths and all(path.exists() and path.stat().st_size > 0 for path in paths):
@@ -79,6 +84,19 @@ def _cached_manifest():
     except Exception:
         log.exception("[OpenCesta] No se pudo leer el manifiesto de caché.")
     return None
+
+
+def _archive_member_path(archive: Path, member_name: str) -> Path:
+    """Genera un nombre único aunque varios Parquet se llamen igual.
+
+    OpenCesta puede publicar particiones como
+    chain=mercadona/zone=mad1/date=.../prices.parquet y
+    chain=dia/zone=es-default/date=.../prices.parquet.
+    No se debe aplanar solo al basename porque ambas rutas colisionan.
+    """
+    digest = hashlib.sha256(member_name.encode("utf-8")).hexdigest()[:12]
+    basename = Path(member_name).name or "data.parquet"
+    return CACHE_DIR / f"{archive.stem}_{digest}_{basename}"
 
 
 def _download_latest_release() -> tuple[str, list[Path]]:
@@ -111,6 +129,7 @@ def _download_latest_release() -> tuple[str, list[Path]]:
     if cached and cached[0] == tag:
         manifest_path = CACHE_DIR / "manifest.json"
         manifest_path.write_text(json.dumps({
+            "cache_format": 2,
             "tag": tag, "downloaded_at": time.time(),
             "parquet_files": [p.name for p in cached[1]],
         }), encoding="utf-8")
@@ -148,7 +167,7 @@ def _download_latest_release() -> tuple[str, list[Path]]:
                 for member in zf.infolist():
                     if member.is_dir() or not member.filename.lower().endswith(".parquet"):
                         continue
-                    out = CACHE_DIR / f"{archive.stem}_{Path(member.filename).name}"
+                    out = _archive_member_path(archive, member.filename)
                     if not out.exists() or out.stat().st_size == 0:
                         with zf.open(member) as src, out.open("wb") as dst:
                             _copy(src, dst)
@@ -161,7 +180,7 @@ def _download_latest_release() -> tuple[str, list[Path]]:
                     src = tf.extractfile(member)
                     if src is None:
                         continue
-                    out = CACHE_DIR / f"{archive.stem}_{Path(member.name).name}"
+                    out = _archive_member_path(archive, member.name)
                     if not out.exists() or out.stat().st_size == 0:
                         with src, out.open("wb") as dst:
                             _copy(src, dst)
@@ -170,6 +189,7 @@ def _download_latest_release() -> tuple[str, list[Path]]:
         raise RuntimeError("Los assets de OpenCesta no contienen Parquet reconocible.")
     manifest_path = CACHE_DIR / "manifest.json"
     manifest_path.write_text(json.dumps({
+        "cache_format": 2,
         "tag": tag, "downloaded_at": time.time(),
         "parquet_files": [p.name for p in parquet_files],
     }), encoding="utf-8")

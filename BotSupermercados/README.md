@@ -177,3 +177,10 @@ Al cargar una nueva release, MiCestita registra automáticamente en los logs de 
 - Resultado del comando `opencesta zone <CP>`: ejecutable, código de salida y salida estándar/error (truncadas).
 
 Estos registros permiten distinguir si el catálogo no contiene filas de Mercadona, si sus campos tienen nombres/formato distintos o si falla la resolución del código postal. No se asigna una zona alternativa si no aparece publicada en el catálogo. Busca en Render los mensajes `[OpenCesta][Diagnóstico]` y `[OpenCesta][Diagnóstico zona]` después del primer producto consultado tras el despliegue.
+
+
+### Corrección de extracción de OpenCesta
+
+Los archivos Parquet dentro de `prices.tar.gz` pueden compartir el nombre `prices.parquet` en particiones distintas (por cadena, zona y fecha). El extractor conserva ahora un identificador derivado de la ruta interna para no sobrescribir ni reutilizar el Parquet de otra partición. Se incrementa `cache_format` a 2 para forzar la reextracción de los archivos ya descargados en `/tmp` tras actualizar el despliegue.
+
+Esto no añade ningún proveedor de pago. Permite recuperar todas las particiones que realmente incluya la release; si una cadena no publica precios en ella, seguirá apareciendo como no disponible.

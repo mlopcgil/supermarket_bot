@@ -42,6 +42,9 @@ SEARCH_TEMPLATES = {
 }
 
 SESSION = requests.Session()
+# Si un comercio responde 403/429, se pausa temporalmente ese conector para
+# no repetir una petición bloqueada por cada producto de la lista.
+_BLOCKED_UNTIL: dict[str, float] = {}
 SESSION.headers.update({
     "User-Agent": USER_AGENT,
     "Accept": "text/html,application/xhtml+xml,application/ld+json;q=0.9,*/*;q=0.8",
@@ -172,15 +175,25 @@ def search_public_catalog(query: str, stores: list[str], postal_code: str) -> li
     for supermarket in ("Alcampo", "Carrefour"):
         if supermarket not in stores:
             continue
+        if time.time() < _BLOCKED_UNTIL.get(supermarket, 0):
+            log.info("[%s] Conector pausado temporalmente tras una respuesta 403/429 anterior.", supermarket)
+            continue
         template = SEARCH_TEMPLATES[supermarket]
         url = template.format(query=quote_plus(query), postal_code=quote_plus(postal_code))
         try:
             response = SESSION.get(url, timeout=TIMEOUT)
+            if response.status_code in (403, 429):
+                _BLOCKED_UNTIL[supermarket] = time.time() + 900
+                log.warning("[%s] La web respondió HTTP %s; se pausa el conector 15 minutos. No equivale a que no haya productos.", supermarket, response.status_code)
+                continue
             response.raise_for_status()
             rows = list(_extract_products(response.text, response.url, supermarket, query, postal_code))
             log.info("[%s] Consulta '%s': %s ofertas JSON-LD", supermarket, query, len(rows))
             results.extend(rows)
         except requests.RequestException as exc:
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status in (403, 429):
+                _BLOCKED_UNTIL[supermarket] = time.time() + 900
             log.warning("[%s] No se pudo consultar el catálogo público: %s", supermarket, exc)
         # Evita lanzar varias búsquedas seguidas contra los comercios.
         time.sleep(0.35)

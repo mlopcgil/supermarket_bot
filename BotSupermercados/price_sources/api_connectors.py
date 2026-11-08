@@ -33,9 +33,19 @@ SESSION.headers.update({
     "User-Agent": os.getenv("PRICE_USER_AGENT", "MiCestita/1.0 price-comparison-bot"),
     "Accept": "application/vnd.github+json, application/octet-stream, */*",
 })
+# GitHub permite 60 peticiones/hora sin autenticar y muchas más con token.
+# Render debe tener GITHUB_TOKEN o GH_TOKEN con el token completo.
+GITHUB_TOKEN = (os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or "").strip()
+if GITHUB_TOKEN:
+    SESSION.headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
+    log.info("[OpenCesta] Token de GitHub configurado (valor oculto).")
+else:
+    log.warning("[OpenCesta] No hay GITHUB_TOKEN/GH_TOKEN; se usará el límite anónimo de GitHub.")
 _FRAME = None
 _FRAME_AT = 0.0
 _FRAME_TAG = None
+_LOAD_FAILURE_AT = 0.0
+_LOAD_FAILURE_MESSAGE = None
 
 STORE_TO_CHAIN = {
     "mercadona": "mercadona", "dia": "dia", "ahorramas": "ahorramas",
@@ -55,22 +65,56 @@ def _copy(src, dst):
     shutil.copyfileobj(src, dst)
 
 
+def _cached_manifest():
+    """Devuelve la caché local aunque haya expirado, si sus Parquet existen."""
+    manifest_path = CACHE_DIR / "manifest.json"
+    if not manifest_path.exists():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        names = manifest.get("parquet_files") or []
+        paths = [CACHE_DIR / name for name in names]
+        if paths and all(path.exists() and path.stat().st_size > 0 for path in paths):
+            return str(manifest.get("tag") or "cached"), paths, float(manifest.get("downloaded_at", 0))
+    except Exception:
+        log.exception("[OpenCesta] No se pudo leer el manifiesto de caché.")
+    return None
+
+
 def _download_latest_release() -> tuple[str, list[Path]]:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    response = SESSION.get(RELEASES_URL, timeout=TIMEOUT)
-    response.raise_for_status()
-    release = response.json()
+    cached = _cached_manifest()
+    # No consultar GitHub en cada producto: reutilizar la release durante el TTL.
+    if cached and time.time() - cached[2] < CACHE_TTL:
+        log.info("[OpenCesta] Usando caché %s (edad %.1f h).", cached[0], (time.time() - cached[2]) / 3600)
+        return cached[0], cached[1]
+
+    try:
+        response = SESSION.get(RELEASES_URL, timeout=TIMEOUT)
+        if response.status_code == 403 and "rate limit" in response.text.lower():
+            remaining = response.headers.get("X-RateLimit-Remaining", "desconocido")
+            reset = response.headers.get("X-RateLimit-Reset", "desconocido")
+            raise RuntimeError(
+                f"GitHub ha agotado el límite de API (remaining={remaining}, reset={reset}). "
+                "Configura un GITHUB_TOKEN válido en Render."
+            )
+        response.raise_for_status()
+        release = response.json()
+    except Exception as exc:
+        if cached:
+            log.warning("[OpenCesta] No se pudo actualizar la release (%s). Se usa caché %s.", exc, cached[0])
+            return cached[0], cached[1]
+        raise
+
     tag = str(release.get("tag_name") or release.get("name") or "latest")
-    manifest_path = CACHE_DIR / "manifest.json"
-    if manifest_path.exists():
-        try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            if manifest.get("tag") == tag and time.time() - manifest.get("downloaded_at", 0) < CACHE_TTL:
-                paths = [CACHE_DIR / n for n in manifest.get("parquet_files", [])]
-                if paths and all(p.exists() for p in paths):
-                    return tag, paths
-        except Exception:
-            log.warning("Caché de OpenCesta inválida; se volverá a descargar.")
+    # Si el tag no ha cambiado, no descargar otra vez los mismos Parquet.
+    if cached and cached[0] == tag:
+        manifest_path = CACHE_DIR / "manifest.json"
+        manifest_path.write_text(json.dumps({
+            "tag": tag, "downloaded_at": time.time(),
+            "parquet_files": [p.name for p in cached[1]],
+        }), encoding="utf-8")
+        return tag, cached[1]
 
     assets = release.get("assets") or []
     if not assets:
@@ -124,6 +168,7 @@ def _download_latest_release() -> tuple[str, list[Path]]:
                     parquet_files.append(out)
     if not parquet_files:
         raise RuntimeError("Los assets de OpenCesta no contienen Parquet reconocible.")
+    manifest_path = CACHE_DIR / "manifest.json"
     manifest_path.write_text(json.dumps({
         "tag": tag, "downloaded_at": time.time(),
         "parquet_files": [p.name for p in parquet_files],
@@ -132,23 +177,32 @@ def _download_latest_release() -> tuple[str, list[Path]]:
 
 
 def _load_dataset(force=False):
-    global _FRAME, _FRAME_AT, _FRAME_TAG
+    global _FRAME, _FRAME_AT, _FRAME_TAG, _LOAD_FAILURE_AT, _LOAD_FAILURE_MESSAGE
     if not force and _FRAME is not None and time.time() - _FRAME_AT < CACHE_TTL:
         return _FRAME_TAG, _FRAME
-    tag, files = _download_latest_release()
-    frames = []
-    for path in files:
-        try:
-            frames.append(pd.read_parquet(path))
-        except Exception:
-            log.exception("[OpenCesta] Error leyendo %s", path)
-    if not frames:
-        raise RuntimeError("No se pudo leer ningún Parquet. Instala pyarrow.")
-    _FRAME = pd.concat(frames, ignore_index=True, sort=False)
-    _FRAME.columns = [str(c).lower().strip() for c in _FRAME.columns]
-    _FRAME_AT, _FRAME_TAG = time.time(), tag
-    log.info("[OpenCesta] Release %s: %s filas", tag, len(_FRAME))
-    return tag, _FRAME
+    # Si la API falla y no hay caché, no repetir la misma petición por cada artículo.
+    if not force and _LOAD_FAILURE_AT and time.time() - _LOAD_FAILURE_AT < 600:
+        raise RuntimeError(_LOAD_FAILURE_MESSAGE or "OpenCesta temporalmente no disponible; reintento en 10 minutos.")
+    try:
+        tag, files = _download_latest_release()
+        frames = []
+        for path in files:
+            try:
+                frames.append(pd.read_parquet(path))
+            except Exception:
+                log.exception("[OpenCesta] Error leyendo %s", path)
+        if not frames:
+            raise RuntimeError("No se pudo leer ningún Parquet. Instala pyarrow.")
+        _FRAME = pd.concat(frames, ignore_index=True, sort=False)
+        _FRAME.columns = [str(c).lower().strip() for c in _FRAME.columns]
+        _FRAME_AT, _FRAME_TAG = time.time(), tag
+        _LOAD_FAILURE_AT, _LOAD_FAILURE_MESSAGE = 0.0, None
+        log.info("[OpenCesta] Release %s: %s filas", tag, len(_FRAME))
+        return tag, _FRAME
+    except Exception as exc:
+        _LOAD_FAILURE_AT, _LOAD_FAILURE_MESSAGE = time.time(), str(exc)
+        log.exception("[OpenCesta] Error cargando dataset; se conserva la caché disponible.")
+        raise
 
 
 _ZONE_CACHE: dict[str, str | None] = {}
@@ -391,10 +445,10 @@ def fetch_live_prices(query: str, stores: list[str], zip_code: str | None = None
         try:
             log.info("[OpenCesta] '%s' | tiendas=%s | CP=%s", query, opencesta_stores, zip_code)
             results.extend(search_opencesta(query, opencesta_stores, zip_code))
-        except requests.RequestException:
-            log.exception("[OpenCesta] Error HTTP consultando la release.")
-        except Exception:
-            log.exception("[OpenCesta] No se pudo consultar el dataset.")
+        except requests.RequestException as exc:
+            log.error("[OpenCesta] Error HTTP consultando la release: %s", exc)
+        except Exception as exc:
+            log.error("[OpenCesta] No se pudo consultar el dataset: %s", exc)
 
     web_stores = [s for s in stores if norm(s) in {"alcampo", "carrefour", "lidl"}]
     if web_stores:

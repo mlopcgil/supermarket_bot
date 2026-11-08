@@ -22,6 +22,13 @@ class ShoppingComparisonTests(unittest.TestCase):
         self.assertEqual(result["items"][0]["cheapest"], "A")
         self.assertEqual(result["items"][0]["savings"], 0.2)
 
+    def test_single_complete_basket_is_not_declared_cheapest(self):
+        queried = [{"query": "huevos", "prices": [
+            {"supermarket": "DIA", "name": "Huevos M", "pack_price": 2.5, "unit_price": None, "unit": None}
+        ]}]
+        result = compare_shopping_list(["huevos"], ["DIA", "Alcampo"], queried)
+        self.assertIsNone(result["best_total"])
+
 
 class JsonLdConnectorTests(unittest.TestCase):
     def test_extracts_only_real_product_offer_prices(self):

@@ -93,7 +93,9 @@ def compare_shopping_list(items, stores, queried):
         }
 
     eligible = [s for s, d in totals.items() if d["found"] == len(output) and len(output) > 0]
-    best_total = min(eligible, key=lambda s: totals[s]["total"]) if eligible else None
+    # Para proclamar una cesta ganadora hacen falta al menos dos supermercados
+    # con todos los productos; una única cesta completa no es una comparación.
+    best_total = min(eligible, key=lambda s: totals[s]["total"]) if len(eligible) >= 2 else None
     return {"items": output, "totals": totals, "best_total": best_total, "item_count": len(output)}
 
 
@@ -120,11 +122,12 @@ def format_comparison(result):
                 lines.append(f"      Ubicación del precio: {location_label}; no es una tarifa exacta de tu CP.")
             elif raw_data.get("location_scope") == "web_catalog_for_requested_postal_code_unverified":
                 lines.append("      Precio observado en la web; la tienda/zona de entrega no ha podido verificarse.")
+            source = p.get("source") or "fuente no identificada"
             if pack_price is not None:
-                lines.append(f"  • {store}: envase *{pack_price:.2f} €* — dato {age}")
+                lines.append(f"  • {store}: envase *{pack_price:.2f} €* — dato {age} — fuente: {source}")
             else:
-                lines.append(f"  • {store}: precio de envase no disponible — dato {age}")
-            if p.get("unit_price") is not None and p.get("unit"):
+                lines.append(f"  • {store}: precio de envase no disponible — dato {age} — fuente: {source}")
+            if p.get("unit_price") is not None and p.get("unit") and str(p.get("unit")).lower() != "envase":
                 lines.append(f"      Precio de referencia: {p['unit_price']:.2f} €/{p['unit']}")
         if item["cheapest"]:
             lines.append(f"  Más barato por {item['comparison_unit']}: *{item['cheapest']}*")
@@ -144,7 +147,13 @@ def format_comparison(result):
     if result["best_total"]:
         lines.append(f"\n🏆 *Menor coste para toda la lista: {result['best_total']}*")
     else:
-        lines.append("\nNo hay un supermercado con precios de envase para todos los productos; no comparo totales incompletos como si fueran equivalentes.")
+        complete = [store for store, data in result["totals"].items() if data["found"] == result["item_count"] and result["item_count"] > 0]
+        if len(complete) == 1:
+            only = complete[0]
+            total = result["totals"][only]["total"]
+            lines.append(f"\nℹ️ *Única lista completa disponible: {only} ({total:.2f} €).* No se puede afirmar que sea la más barata porque faltan precios completos de otros supermercados.")
+        else:
+            lines.append("\nNo hay al menos dos supermercados con precios de envase para todos los productos; no comparo totales incompletos como si fueran equivalentes.")
 
     no_data = {store for store, data in result["totals"].items() if data["found"] == 0}
     if "Lidl" in no_data:

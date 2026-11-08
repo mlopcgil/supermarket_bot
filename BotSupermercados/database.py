@@ -58,6 +58,7 @@ def init_db():
             brand TEXT,
             package_size TEXT,
             unit_price NUMERIC(12,4),
+            pack_price NUMERIC(12,4),
             unit TEXT,
             product_url TEXT,
             source TEXT NOT NULL,
@@ -67,6 +68,7 @@ def init_db():
             available BOOLEAN NOT NULL DEFAULT TRUE,
             raw_data JSONB NOT NULL DEFAULT '{}'::jsonb
         );
+        ALTER TABLE products ADD COLUMN IF NOT EXISTS pack_price NUMERIC(12,4);
         CREATE INDEX IF NOT EXISTS idx_products_lookup ON products(normalized_name);
         CREATE INDEX IF NOT EXISTS idx_products_store_date ON products(supermarket_id, captured_at DESC);
         """)
@@ -135,13 +137,17 @@ def save_live_prices(products):
             key = f"{supermarket}|{identity}|{zone}|{p.get('postal_code') or 'regional'}|{p['captured_at']}"
             cur.execute("""
                 INSERT INTO products(
-                  source_key, name, normalized_name, unit_price, unit, product_url,
-                  brand, source, captured_at, postal_code, supermarket_id, raw_data
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
+                  source_key, name, normalized_name, canonical_key, package_size,
+                  unit_price, pack_price, unit, product_url, brand, source,
+                  captured_at, postal_code, supermarket_id, raw_data
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb)
                 ON CONFLICT(source_key) DO UPDATE SET
                   name=EXCLUDED.name,
                   normalized_name=EXCLUDED.normalized_name,
+                  canonical_key=EXCLUDED.canonical_key,
+                  package_size=EXCLUDED.package_size,
                   unit_price=EXCLUDED.unit_price,
+                  pack_price=EXCLUDED.pack_price,
                   unit=EXCLUDED.unit,
                   product_url=EXCLUDED.product_url,
                   brand=EXCLUDED.brand,
@@ -151,42 +157,53 @@ def save_live_prices(products):
                   raw_data=EXCLUDED.raw_data,
                   available=TRUE
             """, (
-                key, p["name"], p["normalized_name"], p["unit_price"], p.get("unit"),
-                p.get("product_url"), p.get("brand"), p.get("source"), p["captured_at"],
+                key, p["name"], p["normalized_name"], p.get("canonical_key"),
+                p.get("package_size"), p.get("unit_price"),
+                p.get("pack_price", p.get("price")), p.get("unit"), p.get("product_url"),
+                p.get("brand"), p.get("source"), p["captured_at"],
                 p.get("postal_code"), sid, json.dumps(p.get("raw_data") or {}, default=str)
             ))
 
 def get_prices_for_query(items, stores, postal_code=None):
-    """Consulta OpenCesta y completa con precios recientes ya almacenados.
+    """Consulta conectores y recupera solo precios recientes del CP solicitado.
 
-    No utiliza un CP predeterminado. Los registros regionales (postal_code NULL)
-    solo se aceptan como tales y conservan su fuente/fecha en la respuesta.
+    Los registros regionales de OpenCesta se aceptan únicamente si se
+    descargaron para ese mismo CP; los datos nacionales deben marcarse de forma
+    explícita con raw_data.region_scope='national'.
     """
     if not postal_code or not str(postal_code).strip().isdigit() or len(str(postal_code).strip()) != 5:
         return [{"query": item, "prices": []} for item in items]
+    postal_code = str(postal_code).strip()
 
     try:
         from price_sources.api_connectors import fetch_live_prices
         for query in items:
-            live_data = fetch_live_prices(query, stores, str(postal_code).strip())
+            live_data = fetch_live_prices(query, stores, postal_code)
             if live_data:
                 save_live_prices(live_data)
-    except Exception as e:
+    except Exception:
         import logging
-        logging.getLogger(__name__).exception("Error al obtener datos en vivo: %s", e)
+        logging.getLogger(__name__).exception("Error al obtener datos en vivo")
 
+    max_age_days = int(os.getenv("PRICE_MAX_AGE_DAYS", "3"))
     with db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
         cur.execute("""
             SELECT p.name, p.normalized_name, p.canonical_key, p.brand, p.package_size,
-                   p.unit_price, p.unit, p.product_url, p.source, p.captured_at,
+                   p.unit_price, p.pack_price, p.unit, p.product_url, p.source, p.captured_at,
                    p.postal_code, p.raw_data, s.name AS supermarket
             FROM products p JOIN supermarkets s ON s.id=p.supermarket_id
             WHERE s.name = ANY(%s)
               AND p.available=TRUE
-              AND p.captured_at >= CURRENT_DATE - 3
-              AND (p.postal_code IS NULL OR p.postal_code=%s)
+              AND p.captured_at >= CURRENT_DATE - %s
+              AND (
+                    p.postal_code=%s
+                    OR (p.postal_code IS NULL AND (
+                        p.raw_data->>'requested_postal_code'=%s
+                        OR p.raw_data->>'region_scope'='national'
+                    ))
+              )
             ORDER BY p.captured_at DESC
-        """, (stores, str(postal_code).strip()))
+        """, (stores, max_age_days, postal_code, postal_code))
         rows = cur.fetchall()
 
     import unicodedata, re
@@ -206,11 +223,10 @@ def get_prices_for_query(items, stores, postal_code=None):
             score = sum(1 for term in terms if term in name_terms or (len(term) > 4 and term[:-1] in name_terms))
             if q and q in name_norm:
                 score += 5
-            # Evita que una coincidencia de una palabra en una consulta larga
-            # devuelva productos poco relacionados.
             if score > 0 and (len(terms) <= 1 or score >= max(1, len(terms) - 1)):
                 item = dict(row)
                 item["unit_price"] = float(item["unit_price"]) if item["unit_price"] is not None else None
+                item["pack_price"] = float(item["pack_price"]) if item["pack_price"] is not None else None
                 item["_match_score"] = score
                 matches.append(item)
 

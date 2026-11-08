@@ -5,6 +5,9 @@ from flask import Flask, request
 import telebot
 from telebot import types
 from dotenv import load_dotenv
+
+load_dotenv()
+
 from database import (
     init_db, ensure_user, get_user_supermarkets, set_user_supermarkets,
     get_supermarkets, get_prices_for_query, save_session, set_postal_code,
@@ -12,7 +15,6 @@ from database import (
 )
 from shopping import parse_list, compare_shopping_list, format_comparison
 
-load_dotenv()
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger(__name__)
 
@@ -21,20 +23,6 @@ if not TOKEN:
     raise RuntimeError("Falta TELEGRAM_TOKEN en el entorno/.env")
 
 bot = telebot.TeleBot(TOKEN, threaded=False)
-
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-
-if WEBHOOK_URL:
-    webhook_url = WEBHOOK_URL.rstrip("/")
-
-    if not webhook_url.endswith("/telegram-webhook"):
-        raise ValueError("WEBHOOK_URL debe terminar en /telegram-webhook")
-
-    if bot.set_webhook(url=webhook_url):
-        log.info("Webhook configurado correctamente")
-    else:
-        raise RuntimeError("No se pudo configurar el webhook")
-
 app = Flask(__name__)
 init_db()
 
@@ -208,6 +196,21 @@ def shopping_callback(call):
         result = compare_shopping_list(items, stores, prices)
         save_session(uid, items, stores, result)
         text = format_comparison(result)
+        fallback_zones = set()
+        for entry in prices:
+            for price in entry.get("prices", []):
+                raw_data = price.get("raw_data") or {}
+                if raw_data.get("location_fallback"):
+                    fallback_zones.add(str(raw_data.get("zone") or "zona de Madrid"))
+        if fallback_zones:
+            zones_text = ", ".join(sorted(fallback_zones))
+            warning = (
+                "⚠️ *Aviso sobre la ubicación:* no hay precios de Mercadona publicados "
+                f"para tu código postal {get_postal_code(uid)}. He utilizado precios de "
+                f"otra zona disponible de Madrid ({zones_text}). No son necesariamente "
+                "los precios exactos de tu código postal.\n\n"
+            )
+            text = warning + text
         bot.send_message(call.message.chat.id, text, disable_web_page_preview=True, parse_mode="Markdown", reply_markup=get_main_keyboard())
     except Exception:
         log.exception("Error comparando lista")

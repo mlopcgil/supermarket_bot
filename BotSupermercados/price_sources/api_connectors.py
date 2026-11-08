@@ -1,8 +1,8 @@
-"""Adaptador de precios para MiCestita basado en el dataset público OpenCesta.
+"""Agregador de fuentes públicas para MiCestita.
 
-No se inventan precios: solo se devuelven filas presentes en la última release.
-La cobertura publicada es parcial (Mercadona, DIA y Ahorramás en las zonas
-indicadas por OpenCesta); el resto de cadenas se informa como sin cobertura.
+No se inventan precios: OpenCesta aporta snapshots publicados y Alcampo /
+Carrefour se consultan mediante sus páginas públicas cuando exponen ofertas
+JSON-LD. La cobertura es parcial; Lidl alimentación se deja para CSV verificado.
 """
 from __future__ import annotations
 
@@ -14,10 +14,9 @@ import shutil
 import subprocess
 import tarfile
 import time
-import threading
 import unicodedata
 import zipfile
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -34,15 +33,9 @@ SESSION.headers.update({
     "User-Agent": os.getenv("PRICE_USER_AGENT", "MiCestita/1.0 price-comparison-bot"),
     "Accept": "application/vnd.github+json, application/octet-stream, */*",
 })
-# GitHub permite más peticiones autenticadas. El token es opcional.
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
-if GITHUB_TOKEN:
-    SESSION.headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-
 _FRAME = None
 _FRAME_AT = 0.0
 _FRAME_TAG = None
-_LOAD_LOCK = threading.Lock()
 
 STORE_TO_CHAIN = {
     "mercadona": "mercadona", "dia": "dia", "ahorramas": "ahorramas",
@@ -62,168 +55,100 @@ def _copy(src, dst):
     shutil.copyfileobj(src, dst)
 
 
-def _cached_manifest():
-    """Devuelve (tag, rutas parquet, manifiesto) si la caché local es válida."""
-    manifest_path = CACHE_DIR / "manifest.json"
-    if not manifest_path.exists():
-        return None
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        names = manifest.get("parquet_files") or []
-        paths = []
-        for name in names:
-            candidate = Path(name)
-            # Compatibilidad con el manifiesto antiguo (solo nombre de archivo).
-            path = candidate if candidate.is_absolute() else CACHE_DIR / candidate
-            paths.append(path)
-        if paths and all(path.is_file() and path.stat().st_size > 0 for path in paths):
-            return str(manifest.get("tag") or "cached"), paths, manifest
-    except Exception:
-        log.exception("[OpenCesta] No se pudo leer el manifiesto de caché.")
-    return None
-
-
-def _use_cached_manifest(cached, reason: str):
-    if not cached:
-        return None
-    tag, paths, manifest = cached
-    age = max(0, time.time() - float(manifest.get("downloaded_at", 0)))
-    log.warning(
-        "[OpenCesta] Se reutiliza la caché %s (edad: %.1f horas). Motivo: %s",
-        tag, age / 3600, reason,
-    )
-    return tag, paths
-
-
 def _download_latest_release() -> tuple[str, list[Path]]:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    response = SESSION.get(RELEASES_URL, timeout=TIMEOUT)
+    response.raise_for_status()
+    release = response.json()
+    tag = str(release.get("tag_name") or release.get("name") or "latest")
+    manifest_path = CACHE_DIR / "manifest.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if manifest.get("tag") == tag and time.time() - manifest.get("downloaded_at", 0) < CACHE_TTL:
+                paths = [CACHE_DIR / n for n in manifest.get("parquet_files", [])]
+                if paths and all(p.exists() for p in paths):
+                    return tag, paths
+        except Exception:
+            log.warning("Caché de OpenCesta inválida; se volverá a descargar.")
 
-    # La comprobación local va ANTES de llamar a GitHub: así no se consume
-    # el límite de la API por cada producto de la lista.
-    cached = _cached_manifest()
-    if cached:
-        _, _, manifest = cached
-        age = time.time() - float(manifest.get("downloaded_at", 0))
-        if 0 <= age < CACHE_TTL:
-            log.info("[OpenCesta] Usando caché local vigente (%s).", manifest.get("tag"))
-            return cached[0], cached[1]
-
-    try:
-        response = SESSION.get(RELEASES_URL, timeout=TIMEOUT)
-        response.raise_for_status()
-        release = response.json()
-        tag = str(release.get("tag_name") or release.get("name") or "latest")
-        assets = release.get("assets") or []
-        if not assets:
-            raise RuntimeError("La última release de OpenCesta no tiene assets.")
-
-        # Separar directorios por versión evita reutilizar accidentalmente un
-        # archivo de una release anterior que tenga el mismo nombre.
-        safe_tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", tag)[:100] or "latest"
-        release_dir = CACHE_DIR / safe_tag
-        release_dir.mkdir(parents=True, exist_ok=True)
-
-        archives = []
-        for asset in assets:
-            name, url = asset.get("name", ""), asset.get("browser_download_url")
-            low = name.lower()
-            if not url or not low.endswith((".parquet", ".zip", ".tar.gz", ".tgz")):
-                continue
-            target = release_dir / Path(name).name
-            if not target.exists() or target.stat().st_size == 0:
-                log.info("[OpenCesta] Descargando %s", name)
+    assets = release.get("assets") or []
+    if not assets:
+        raise RuntimeError("La última release de OpenCesta no tiene assets.")
+    archives = []
+    for asset in assets:
+        name, url = asset.get("name", ""), asset.get("browser_download_url")
+        low = name.lower()
+        if not url or not low.endswith((".parquet", ".zip", ".tar.gz", ".tgz")):
+            continue
+        target = CACHE_DIR / name
+        if not target.exists() or target.stat().st_size == 0:
+            log.info("[OpenCesta] Descargando %s", name)
+            with SESSION.get(url, stream=True, timeout=TIMEOUT) as r:
+                r.raise_for_status()
                 tmp = target.with_name(target.name + ".part")
-                try:
-                    with SESSION.get(url, stream=True, timeout=TIMEOUT) as r:
-                        r.raise_for_status()
-                        with tmp.open("wb") as f:
-                            for chunk in r.iter_content(1024 * 1024):
-                                if chunk:
-                                    f.write(chunk)
-                    tmp.replace(target)
-                finally:
-                    if tmp.exists():
-                        tmp.unlink()
-            archives.append(target)
+                with tmp.open("wb") as f:
+                    for chunk in r.iter_content(1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                tmp.replace(target)
+        archives.append(target)
 
-        parquet_files = []
-        for archive in archives:
-            low = archive.name.lower()
-            if low.endswith(".parquet"):
-                parquet_files.append(archive)
-            elif low.endswith(".zip"):
-                with zipfile.ZipFile(archive) as zf:
-                    for member in zf.infolist():
-                        if member.is_dir() or not member.filename.lower().endswith(".parquet"):
-                            continue
-                        out = release_dir / f"{archive.stem}_{Path(member.filename).name}"
-                        if not out.exists() or out.stat().st_size == 0:
-                            with zf.open(member) as src, out.open("wb") as dst:
-                                _copy(src, dst)
-                        parquet_files.append(out)
-            else:
-                with tarfile.open(archive, "r:gz") as tf:
-                    for member in tf.getmembers():
-                        if not member.isfile() or not member.name.lower().endswith(".parquet"):
-                            continue
-                        src_file = tf.extractfile(member)
-                        if src_file is None:
-                            continue
-                        out = release_dir / f"{archive.stem}_{Path(member.name).name}"
-                        if not out.exists() or out.stat().st_size == 0:
-                            with src_file, out.open("wb") as dst:
-                                _copy(src_file, dst)
-                        else:
-                            src_file.close()
-                        parquet_files.append(out)
-
-        if not parquet_files:
-            raise RuntimeError("Los assets de OpenCesta no contienen Parquet reconocible.")
-
-        manifest = {
-            "tag": tag,
-            "downloaded_at": time.time(),
-            "parquet_files": [str(path.relative_to(CACHE_DIR)) for path in parquet_files],
-        }
-        manifest_path = CACHE_DIR / "manifest.json"
-        tmp_manifest = manifest_path.with_suffix(".json.part")
-        tmp_manifest.write_text(json.dumps(manifest), encoding="utf-8")
-        tmp_manifest.replace(manifest_path)
-        log.info("[OpenCesta] Release %s descargada; %s Parquet.", tag, len(parquet_files))
-        return tag, parquet_files
-
-    except Exception as exc:
-        # Si GitHub limita la API o falla una descarga, no descartamos los
-        # datos anteriores: se siguen usando aunque hayan superado el TTL.
-        fallback = _use_cached_manifest(cached, str(exc))
-        if fallback:
-            return fallback
-        raise
+    parquet_files = []
+    for archive in archives:
+        low = archive.name.lower()
+        if low.endswith(".parquet"):
+            parquet_files.append(archive)
+        elif low.endswith(".zip"):
+            with zipfile.ZipFile(archive) as zf:
+                for member in zf.infolist():
+                    if member.is_dir() or not member.filename.lower().endswith(".parquet"):
+                        continue
+                    out = CACHE_DIR / f"{archive.stem}_{Path(member.filename).name}"
+                    if not out.exists() or out.stat().st_size == 0:
+                        with zf.open(member) as src, out.open("wb") as dst:
+                            _copy(src, dst)
+                    parquet_files.append(out)
+        else:
+            with tarfile.open(archive, "r:gz") as tf:
+                for member in tf.getmembers():
+                    if not member.isfile() or not member.name.lower().endswith(".parquet"):
+                        continue
+                    src = tf.extractfile(member)
+                    if src is None:
+                        continue
+                    out = CACHE_DIR / f"{archive.stem}_{Path(member.name).name}"
+                    if not out.exists() or out.stat().st_size == 0:
+                        with src, out.open("wb") as dst:
+                            _copy(src, dst)
+                    parquet_files.append(out)
+    if not parquet_files:
+        raise RuntimeError("Los assets de OpenCesta no contienen Parquet reconocible.")
+    manifest_path.write_text(json.dumps({
+        "tag": tag, "downloaded_at": time.time(),
+        "parquet_files": [p.name for p in parquet_files],
+    }), encoding="utf-8")
+    return tag, parquet_files
 
 
 def _load_dataset(force=False):
     global _FRAME, _FRAME_AT, _FRAME_TAG
-    # Evita que varias actualizaciones de Telegram descarguen el dataset a la vez.
-    with _LOAD_LOCK:
-        if not force and _FRAME is not None and time.time() - _FRAME_AT < CACHE_TTL:
-            return _FRAME_TAG, _FRAME
-
-        tag, files = _download_latest_release()
-        frames = []
-        for path in files:
-            try:
-                frames.append(pd.read_parquet(path))
-            except Exception:
-                log.exception("[OpenCesta] Error leyendo %s", path)
-        if not frames:
-            raise RuntimeError("No se pudo leer ningún Parquet. Instala una versión compatible de pyarrow.")
-        frame = pd.concat(frames, ignore_index=True, sort=False)
-        frame.columns = [str(c).lower().strip() for c in frame.columns]
-
-        _FRAME = frame
-        _FRAME_AT, _FRAME_TAG = time.time(), tag
-        log.info("[OpenCesta] Release %s: %s filas", tag, len(_FRAME))
-        return tag, _FRAME
+    if not force and _FRAME is not None and time.time() - _FRAME_AT < CACHE_TTL:
+        return _FRAME_TAG, _FRAME
+    tag, files = _download_latest_release()
+    frames = []
+    for path in files:
+        try:
+            frames.append(pd.read_parquet(path))
+        except Exception:
+            log.exception("[OpenCesta] Error leyendo %s", path)
+    if not frames:
+        raise RuntimeError("No se pudo leer ningún Parquet. Instala pyarrow.")
+    _FRAME = pd.concat(frames, ignore_index=True, sort=False)
+    _FRAME.columns = [str(c).lower().strip() for c in _FRAME.columns]
+    _FRAME_AT, _FRAME_TAG = time.time(), tag
+    log.info("[OpenCesta] Release %s: %s filas", tag, len(_FRAME))
+    return tag, _FRAME
 
 
 _ZONE_CACHE: dict[str, str | None] = {}
@@ -257,11 +182,70 @@ def _first(row: dict, *keys, default=None):
     return default
 
 
-def _date(value) -> str:
+def _date(value, release_tag: str | None = None) -> tuple[str, bool]:
+    """Devuelve fecha y marca si hubo que estimarla.
+
+    Se usa primero la fecha del registro, después la fecha incluida en el
+    identificador de release y, si tampoco existe, la fecha actual.
+    """
+    if value is not None and not (isinstance(value, str) and not value.strip()):
+        try:
+            parsed = pd.to_datetime(value, errors="raise", utc=True)
+            if not pd.isna(parsed):
+                return parsed.date().isoformat(), False
+        except Exception:
+            pass
+    match = re.search(r"(20\d{2}-\d{2}-\d{2})", str(release_tag or ""))
+    if match:
+        try:
+            return date.fromisoformat(match.group(1)).isoformat(), True
+        except ValueError:
+            pass
+    return date.today().isoformat(), True
+
+
+def _madrid_fallback_zone(zones: set[str], requested_zone: str | None) -> str | None:
+    """Elige una zona de Madrid publicada cuando no existe la zona exacta.
+
+    Si el resolver devuelve madN, se aproxima a la zona publicada con sufijo
+    numérico más cercano. El número identifica una zona de OpenCesta, no una
+    distancia geográfica; por eso siempre se avisa de que es aproximada.
+    """
+    candidates = sorted(z for z in zones if z == "madrid" or z.startswith("mad"))
+    if not candidates:
+        return None
+    if requested_zone in candidates:
+        return requested_zone
+    requested_match = re.fullmatch(r"mad(\d+)", requested_zone or "")
+    numbered = [z for z in candidates if re.fullmatch(r"mad\d+", z)]
+    if requested_match and numbered:
+        target = int(requested_match.group(1))
+        return min(numbered, key=lambda z: (abs(int(z[3:]) - target), z))
+    return numbered[0] if numbered else candidates[0]
+
+
+def _reference_unit(value) -> str | None:
+    """Normaliza unidades de precio de referencia para comparar magnitudes equivalentes."""
+    if value is None or pd.isna(value):
+        return None
+    raw = norm(value).replace(" ", "")
+    if any(token in raw for token in ("kg", "kilo", "kilogramo")):
+        return "kg"
+    if any(token in raw for token in ("100g", "100gram")):
+        return "100g"
+    if any(token in raw for token in ("litro", "litros", "/l", "eur/l", "€/l")):
+        return "l"
+    if any(token in raw for token in ("unidad", "ud", "/u", "unit")):
+        return "unidad"
+    return None
+
+
+def _positive_number(value):
     try:
-        return pd.to_datetime(value).date().isoformat()
-    except Exception:
-        return date.today().isoformat()
+        number = float(str(value).replace(",", "."))
+        return number if number > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _score(query: str, name: str) -> int:
@@ -295,22 +279,41 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
         if subset.empty:
             continue
 
-        # Zona regional. No guardamos el CP como si el precio fuera específico del domicilio.
+        # Zona regional. Para CP de Madrid se permite una zona Mercadona
+        # madrileña alternativa si OpenCesta no publica la zona exacta.
+        selected_zone = None
+        location_fallback = False
         if "zone" in subset.columns:
             zones = set(subset["zone"].dropna().astype(str).str.lower())
             zone = _postal_zone(zip_code)
             if chain == "mercadona":
-                if not zone or zone not in zones:
-                    log.info("[OpenCesta] Sin zona Mercadona publicada para CP %s", zip_code)
+                if zone and zone in zones:
+                    selected_zone = zone
+                elif zip_code.startswith("28"):
+                    selected_zone = _madrid_fallback_zone(zones, zone)
+                    location_fallback = selected_zone is not None
+                    if location_fallback:
+                        log.warning(
+                            "[OpenCesta] CP %s sin zona exacta (%s); usando zona aproximada %s",
+                            zip_code, zone or "no resuelta", selected_zone,
+                        )
+                if not selected_zone:
+                    log.warning(
+                        "[OpenCesta] Mercadona no disponible para CP %s: zona_resuelta=%r; zonas_release=%s",
+                        zip_code, zone, sorted(zones),
+                    )
                     continue
-                subset = subset[subset["zone"].astype(str).str.lower() == zone]
+                log.info("[OpenCesta] Mercadona CP %s -> zona %s (aproximada=%s)", zip_code, selected_zone, location_fallback)
+                subset = subset[subset["zone"].astype(str).str.lower() == selected_zone]
             elif chain == "ahorramas":
                 if not zip_code.startswith("28") or "madrid" not in zones:
                     log.info("[OpenCesta] Ahorramás sin zona publicada para CP %s", zip_code)
                     continue
-                subset = subset[subset["zone"].astype(str).str.lower() == "madrid"]
+                selected_zone = "madrid"
+                subset = subset[subset["zone"].astype(str).str.lower() == selected_zone]
             elif chain == "dia" and "es-default" in zones:
-                subset = subset[subset["zone"].astype(str).str.lower() == "es-default"]
+                selected_zone = "es-default"
+                subset = subset[subset["zone"].astype(str).str.lower() == selected_zone]
 
         subset["_score"] = subset[name_col].astype(str).map(lambda x: _score(query, x))
         # Evitar falsos positivos: exigir al menos una coincidencia textual.
@@ -323,15 +326,19 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
         store_name = CHAIN_TO_STORE.get(chain, requested)
         for row in subset.to_dict("records"):
             name = str(_first(row, name_col, default=""))
-            price = _first(row, "price", "pack_price", "unit_price")
-            try:
-                price = float(price)
-            except (TypeError, ValueError):
+            pack_price = _positive_number(_first(row, "price", "pack_price", "unit_price"))
+            if pack_price is None:
                 continue
-            if price <= 0:
-                continue
-            ref_price = _first(row, "reference_price", "price_per_unit")
+            ref_price = _positive_number(_first(row, "reference_price", "price_per_unit"))
             ref_format = _first(row, "reference_format", "reference_unit")
+            comparison_unit = _reference_unit(ref_format) if ref_price is not None else None
+            # unit_price solo contiene un precio comparable por unidad de medida.
+            # Si OpenCesta no publica referencia, se conserva el precio del envase
+            # pero no se usa para proclamar un ganador entre formatos desconocidos.
+            comparable_price = ref_price if comparison_unit else None
+            captured_at, date_estimated = _date(
+                _first(row, "captured_at", "date", "snapshot_date"), tag
+            )
             product_url = _first(row, "product_url", "url", "share_url", default="https://github.com/ruvelro/opencesta")
             brand = _first(row, "brand")
             product_id = _first(row, "product_id", "sku", "id")
@@ -339,20 +346,26 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
                 "supermarket": store_name,
                 "name": name,
                 "normalized_name": norm(name),
-                "price": price,
-                "unit_price": price,
-                "unit": "envase",
+                "price": pack_price,
+                "pack_price": pack_price,
+                "package_size": str(_first(row, "package_size", "pack_size", "size", "net_content")) if _first(row, "package_size", "pack_size", "size", "net_content") is not None else None,
+                "unit_price": comparable_price,
+                "unit": comparison_unit,
                 "product_url": str(product_url),
                 "brand": str(brand) if brand else None,
                 "source": f"OpenCesta {tag}",
-                "captured_at": _date(_first(row, "captured_at", "date", "snapshot_date")),
+                "captured_at": captured_at,
                 # Dataset por zona/región; no simular que es una tarifa exacta del CP.
                 "postal_code": None,
                 "source_product_id": str(product_id) if product_id is not None else None,
                 "raw_data": {
-                    "zone": _first(row, "zone"),
+                    "zone": selected_zone or _first(row, "zone"),
+                    "location_fallback": location_fallback,
+                    "location_label": "Madrid (zona aproximada)" if location_fallback else None,
+                    "date_estimated": date_estimated,
                     "reference_price": ref_price,
                     "reference_format": ref_format,
+                    "comparison_unit": comparison_unit,
                     "requested_postal_code": zip_code,
                 },
                 "_match_score": int(row.get("_score", 0)),
@@ -361,23 +374,40 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
 
 
 def fetch_live_prices(query: str, stores: list[str], zip_code: str | None = None) -> list[dict]:
-    """Función pública compatible con la integración actual de database.py."""
+    """Consulta fuentes disponibles sin fabricar precios.
+
+    OpenCesta cubre sus cadenas/zona publicadas. Alcampo y Carrefour se
+    consultan mediante sus páginas públicas cuando exponen Product/Offer JSON-LD.
+    Lidl queda fuera del catálogo automático de alimentación en España.
+    """
     if not zip_code or not re.fullmatch(r"\d{5}", str(zip_code).strip()):
         log.warning("[fetch_live_prices] CP ausente/no válido; se omite la consulta.")
         return []
-    try:
-        log.info("[fetch_live_prices] '%s' | tiendas=%s | CP=%s", query, stores, zip_code)
-        rows = search_opencesta(query, stores, str(zip_code).strip())
-        log.info("[fetch_live_prices] '%s': %s productos", query, len(rows))
-        return rows
-    except requests.RequestException:
-        log.exception("[OpenCesta] Error HTTP consultando la release.")
-    except Exception:
-        log.exception("[OpenCesta] No se pudo consultar el dataset.")
-    return []
+    zip_code = str(zip_code).strip()
+    results = []
+
+    opencesta_stores = [s for s in stores if norm(s).replace(" ", "") in STORE_TO_CHAIN]
+    if opencesta_stores:
+        try:
+            log.info("[OpenCesta] '%s' | tiendas=%s | CP=%s", query, opencesta_stores, zip_code)
+            results.extend(search_opencesta(query, opencesta_stores, zip_code))
+        except requests.RequestException:
+            log.exception("[OpenCesta] Error HTTP consultando la release.")
+        except Exception:
+            log.exception("[OpenCesta] No se pudo consultar el dataset.")
+
+    web_stores = [s for s in stores if norm(s) in {"alcampo", "carrefour", "lidl"}]
+    if web_stores:
+        try:
+            from price_sources.web_catalog import search_public_catalog
+            results.extend(search_public_catalog(query, web_stores, zip_code))
+        except Exception:
+            log.exception("[Catálogos web] Error consultando los comercios.")
+
+    log.info("[fetch_live_prices] '%s': %s precios verificados recuperados", query, len(results))
+    return results
 
 
 def clear_cache():
     global _FRAME, _FRAME_AT, _FRAME_TAG
-    with _LOAD_LOCK:
-        _FRAME, _FRAME_AT, _FRAME_TAG = None, 0.0, None
+    _FRAME, _FRAME_AT, _FRAME_TAG = None, 0.0, None

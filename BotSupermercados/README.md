@@ -13,7 +13,10 @@ Bot independiente basado en la estructura del bot de referencia: `pyTelegramBotA
 - Importador CSV de precios verificados.
 - Código postal obligatorio antes de comparar precios.
 - Conector con la última release pública de OpenCesta (Parquet), con caché local.
-- La cobertura depende de las cadenas y zonas que publique OpenCesta; no se simulan precios de las demás tiendas.
+- Conectores web de mejor esfuerzo para Alcampo y Carrefour: solo aceptan precios publicados en JSON-LD `Product` + `Offer`; no sortean bloqueos y pueden devolver cero resultados si cambia la web.
+- Lidl España no dispone de una tienda online de alimentación comparable; los precios de alimentación Lidl se importan desde CSV verificados (por ejemplo, folleto o comprobación en tienda).
+- Aviso de zona cuando Mercadona utiliza una zona madrileña alternativa. El sufijo `madN` no representa distancia geográfica, por lo que el resultado se marca como aproximado.
+- Filtrado de registros por código postal para no reutilizar accidentalmente un precio regional recogido para otro CP.
 
 ## Limitación importante sobre los datos
 
@@ -82,7 +85,7 @@ supermarket,name,price,captured_at
 Mercadona,Leche semidesnatada 1 L,1.05,2026-10-24
 ```
 
-Las columnas opcionales son `source,product_url,brand,package_size,unit,postal_code,source_key,canonical_key,available`. El ejemplo anterior solo explica el formato; **no es un precio de referencia real y no debe cargarse como dato de producción**.
+Las columnas opcionales son `source,product_url,brand,package_size,unit,unit_price,postal_code,source_key,canonical_key,available,region_scope`. `price` es siempre el precio del envase. `unit_price` solo debe rellenarse si la fuente publica el precio por unidad de medida; no se calcula a partir de supuestos. `region_scope=national` solo debe usarse cuando la fuente confirme que el precio es nacional. Si el precio depende de tienda/zona, incluye `postal_code`. El ejemplo anterior solo explica el formato; **no es un precio de referencia real y no debe cargarse como dato de producción**.
 
 Ejecuta:
 
@@ -90,11 +93,29 @@ Ejecuta:
 python import_prices.py ruta\al\fichero.csv --source "nombre-fuente"
 ```
 
-El precio debe ser el precio de paquete y la unidad debe ser explícita si se quiere comparar por unidad de medida. Para comparar productos equivalentes de distintas cadenas, incluye `canonical_key` con el mismo identificador solo cuando marca/formato/tamaño sean equivalentes. Si no se aporta, solo se comparan nombres normalizados idénticos; no se adivina que dos marcas blancas sean equivalentes. El matching textual de esta versión es deliberadamente básico: revisa el resultado antes de confiar en una equivalencia.
+El precio debe ser el precio de paquete. Para comparar por unidad de medida, incluye también `unit_price` publicado y `unit` (por ejemplo, `kg` o `l`). Para comparar productos equivalentes de distintas cadenas, incluye `canonical_key` con el mismo identificador solo cuando marca/formato/tamaño sean equivalentes. Si no se aporta, solo se comparan nombres normalizados idénticos; no se adivina que dos marcas blancas sean equivalentes. El matching textual de esta versión es deliberadamente básico: revisa el resultado antes de confiar en una equivalencia.
 
 La comparación solo acepta registros con fecha de los últimos tres días. Ajusta este criterio conscientemente si la fuente publica con otra frecuencia; no elimines la fecha ni ocultes la antigüedad.
 
-## 6. Comandos del bot
+
+## 6. Conectores automáticos y límites
+
+- **OpenCesta**: Mercadona, DIA y Ahorramás según las zonas que publique la release.
+- **Alcampo y Carrefour**: lectura de datos estructurados públicos JSON-LD. Las URLs de búsqueda se pueden ajustar con `ALCAMPO_SEARCH_URL_TEMPLATE` y `CARREFOUR_SEARCH_URL_TEMPLATE` (admiten `{query}` y `{postal_code}`). La web puede exigir selección de tienda, cambiar su HTML o no exponer precio en JSON-LD; en esos casos el conector devuelve cero precios. El bot indica que la ubicación online no ha podido verificarse.
+- **Lidl**: no hay catálogo online de alimentación completo en España. El bot no confunde el bazar online con el supermercado de alimentación. Para Lidl se utiliza el importador CSV con precios comprobados y fecha/fuente.
+
+Los comercios indican que los precios y el surtido pueden variar por tienda o zona. Un precio de web no debe interpretarse como tarifa garantizada de una tienda física.
+
+## 7. Variables de entorno adicionales
+
+```env
+PRICE_MAX_AGE_DAYS=3
+# Opcionales; solo si cambian las rutas de búsqueda:
+# ALCAMPO_SEARCH_URL_TEMPLATE=https://.../{query}
+# CARREFOUR_SEARCH_URL_TEMPLATE=https://.../{query}
+```
+
+## 8. Comandos del bot
 
 - `/start` o `/ayuda`: instrucciones.
 - `/supermercados`: editar preferencias permanentes.

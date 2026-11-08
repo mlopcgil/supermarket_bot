@@ -1,1 +1,1 @@
-supermarket,name,price,captured_at,source,product_url,brand,package_size,unit,postal_code
+supermarket,name,price,captured_at,source,product_url,brand,package_size,unit,unit_price,postal_code,source_key,canonical_key,available,region_scope

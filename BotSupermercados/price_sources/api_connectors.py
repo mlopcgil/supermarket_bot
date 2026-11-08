@@ -176,6 +176,48 @@ def _download_latest_release() -> tuple[str, list[Path]]:
     return tag, parquet_files
 
 
+def _diagnose_catalog_structure(tag: str, files: list[Path], frames: list[pd.DataFrame], df: pd.DataFrame) -> None:
+    """Registra metadatos del catálogo para diagnosticar cobertura, sin datos sensibles."""
+    log.info("[OpenCesta][Diagnóstico] Release=%s | archivos_parquet=%d | filas_totales=%d", tag, len(files), len(df))
+    for path, frame in zip(files, frames):
+        cols = [str(c).lower().strip() for c in frame.columns]
+        log.info(
+            "[OpenCesta][Diagnóstico] archivo=%s | filas=%d | columnas=%s",
+            path.name, len(frame), cols[:50],
+        )
+        original_chain = next((c for c in frame.columns if str(c).lower().strip() == "chain"), None)
+        if original_chain is not None:
+            counts = frame[original_chain].fillna("<NULL>").astype(str).value_counts().head(25).to_dict()
+            log.info("[OpenCesta][Diagnóstico] archivo=%s | valores_chain=%s", path.name, counts)
+
+    if "chain" not in df.columns:
+        log.warning("[OpenCesta][Diagnóstico] No existe columna chain. Columnas disponibles=%s", list(df.columns))
+        return
+
+    chain_values = df["chain"].fillna("<NULL>").astype(str).value_counts().head(40).to_dict()
+    log.info("[OpenCesta][Diagnóstico] distribución_chain=%s", chain_values)
+    normalized = df["chain"].fillna("").astype(str).map(norm)
+    mercadona_mask = normalized.str.contains("mercadona", regex=False)
+    mercadona_rows = df.loc[mercadona_mask]
+    log.info("[OpenCesta][Diagnóstico] filas_chain_mercadona=%d", len(mercadona_rows))
+    if len(mercadona_rows):
+        if "zone" in mercadona_rows.columns:
+            zone_counts = mercadona_rows["zone"].fillna("<NULL>").astype(str).value_counts().head(40).to_dict()
+            log.info("[OpenCesta][Diagnóstico] zonas_chain_mercadona=%s", zone_counts)
+        else:
+            log.warning("[OpenCesta][Diagnóstico] Hay filas Mercadona pero no existe columna zone.")
+    elif len(df):
+        log.warning(
+            "[OpenCesta][Diagnóstico] No hay valores chain que contengan 'mercadona'. "
+            "Revisar distribución_chain y los archivos anteriores."
+        )
+    if "zone" in df.columns:
+        all_zones = df["zone"].fillna("<NULL>").astype(str).value_counts().head(40).to_dict()
+        log.info("[OpenCesta][Diagnóstico] distribución_global_zone=%s", all_zones)
+    else:
+        log.warning("[OpenCesta][Diagnóstico] No existe columna zone en el dataset agregado.")
+
+
 def _load_dataset(force=False):
     global _FRAME, _FRAME_AT, _FRAME_TAG, _LOAD_FAILURE_AT, _LOAD_FAILURE_MESSAGE
     if not force and _FRAME is not None and time.time() - _FRAME_AT < CACHE_TTL:
@@ -186,15 +228,19 @@ def _load_dataset(force=False):
     try:
         tag, files = _download_latest_release()
         frames = []
+        valid_files = []
         for path in files:
             try:
-                frames.append(pd.read_parquet(path))
+                frame = pd.read_parquet(path)
+                frames.append(frame)
+                valid_files.append(path)
             except Exception:
                 log.exception("[OpenCesta] Error leyendo %s", path)
         if not frames:
             raise RuntimeError("No se pudo leer ningún Parquet. Instala pyarrow.")
         _FRAME = pd.concat(frames, ignore_index=True, sort=False)
         _FRAME.columns = [str(c).lower().strip() for c in _FRAME.columns]
+        _diagnose_catalog_structure(tag, valid_files, frames, _FRAME)
         _FRAME_AT, _FRAME_TAG = time.time(), tag
         _LOAD_FAILURE_AT, _LOAD_FAILURE_MESSAGE = 0.0, None
         log.info("[OpenCesta] Release %s: %s filas", tag, len(_FRAME))
@@ -211,19 +257,34 @@ def _postal_zone(cp: str) -> str | None:
     """Resuelve el CP con el comando oficial de OpenCesta, sin inferir provincias."""
     if cp in _ZONE_CACHE:
         return _ZONE_CACHE[cp]
+    executable = os.getenv("OPENCESTA_CLI", "opencesta")
     try:
+        resolved_executable = shutil.which(executable) or executable
         result = subprocess.run(
-            [os.getenv("OPENCESTA_CLI", "opencesta"), "zone", cp],
+            [executable, "zone", cp],
             capture_output=True, text=True, timeout=12, check=False,
         )
-        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        output = stdout + "\n" + stderr
         # Ejemplo documentado: `28001 -> mad3`.
         match = re.search(r"(?:->|→)\s*([a-z0-9_-]+)", output, re.IGNORECASE)
         if result.returncode == 0 and match:
             _ZONE_CACHE[cp] = match.group(1).lower()
+            log.info(
+                "[OpenCesta][Diagnóstico zona] ejecutable=%s | CP=%s | returncode=%s | zona=%s | stdout=%r",
+                resolved_executable, cp, result.returncode, _ZONE_CACHE[cp], stdout[:500],
+            )
             return _ZONE_CACHE[cp]
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        log.warning("No está disponible el CLI de OpenCesta para resolver el CP %s.", cp)
+        log.warning(
+            "[OpenCesta][Diagnóstico zona] No se pudo resolver CP=%s | ejecutable=%s | "
+            "returncode=%s | stdout=%r | stderr=%r",
+            cp, resolved_executable, result.returncode, stdout[:500], stderr[:500],
+        )
+    except FileNotFoundError as exc:
+        log.warning("[OpenCesta][Diagnóstico zona] CLI no encontrado (%s): %s", executable, exc)
+    except subprocess.TimeoutExpired:
+        log.warning("[OpenCesta][Diagnóstico zona] Timeout resolviendo CP=%s con %s.", cp, executable)
     _ZONE_CACHE[cp] = None
     return None
 

@@ -156,3 +156,24 @@ La dependencia `opencesta` se instala desde su subdirectorio `core` mediante `re
 **Cobertura y precisión:** OpenCesta publica datos por cadena/zona y fecha. El código postal se utiliza para resolver la zona cuando el adaptador lo permite, pero el precio almacenado se etiqueta como regional (`postal_code = NULL`) porque no es una tarifa individual del domicilio. La fuente, fecha, zona y precio de referencia se conservan en `raw_data`. Las tiendas que no aparezcan en el snapshot no devolverán resultados.
 
 **Importante:** después de actualizar este código, vuelve a configurar el webhook de Telegram con la ruta `/telegram-webhook`. Si el token anterior apareció en logs, revócalo en BotFather y configura el nuevo valor de `TELEGRAM_TOKEN`.
+
+
+### GitHub / OpenCesta: evitar HTTP 403 por límite de API
+
+En Render configura `GITHUB_TOKEN` como variable secreta con un token personal de GitHub válido (copia el valor completo, incluido el prefijo `github_pat_` o `ghp_`). No lo incluyas en el repositorio ni lo pegues en logs. El conector usa `GITHUB_TOKEN` o `GH_TOKEN` y reutiliza el manifiesto local durante `OPENCESTA_CACHE_TTL_SECONDS`. Si GitHub limita la API, intenta usar la última release descargada; si no existe caché, informa de que no pudo actualizarse y evita repetir la petición durante 10 minutos.
+
+Tras añadir o cambiar la variable en Render, guarda los cambios y realiza un nuevo deploy/restart. En los logs debe aparecer `Token de GitHub configurado (valor oculto)`; nunca debe aparecer el valor del token.
+
+Las respuestas HTTP 403/429 de las webs de supermercados se consideran bloqueos temporales, no ausencia de productos. El conector pausa ese comercio durante 15 minutos y no intenta saltarse controles anti-bot.
+
+
+### Diagnóstico de cobertura OpenCesta (Mercadona)
+
+Al cargar una nueva release, MiCestita registra automáticamente en los logs de Render:
+
+- Archivos Parquet leídos, número de filas y columnas de cada archivo.
+- Valores y recuentos de `chain`, incluyendo los que identifican a Mercadona.
+- Zonas publicadas para las filas de Mercadona y distribución global de `zone`.
+- Resultado del comando `opencesta zone <CP>`: ejecutable, código de salida y salida estándar/error (truncadas).
+
+Estos registros permiten distinguir si el catálogo no contiene filas de Mercadona, si sus campos tienen nombres/formato distintos o si falla la resolución del código postal. No se asigna una zona alternativa si no aparece publicada en el catálogo. Busca en Render los mensajes `[OpenCesta][Diagnóstico]` y `[OpenCesta][Diagnóstico zona]` después del primer producto consultado tras el despliegue.

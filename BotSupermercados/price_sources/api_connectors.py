@@ -508,38 +508,99 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
     return results
 
 
-def fetch_live_prices(query: str, stores: list[str], zip_code: str | None = None) -> list[dict]:
-    """Consulta fuentes disponibles sin fabricar precios.
+def fetch_live_prices(
+    query: str,
+    stores: list[str],
+    zip_code: str | None = None,
+) -> list[dict]:
+    """Consulta las fuentes disponibles sin fabricar precios.
 
-    OpenCesta cubre sus cadenas/zona publicadas. Alcampo y Carrefour se
-    consultan mediante sus páginas públicas cuando exponen Product/Offer JSON-LD.
-    Lidl queda fuera del catálogo automático de alimentación en España.
+    OpenCesta aporta los datos publicados en sus snapshots.
+    Alcampo, Carrefour y Eroski se consultan mediante sus páginas públicas
+    cuando exponen ofertas JSON-LD.
+    Lidl se consulta mediante su buscador público experimental.
     """
     if not zip_code or not re.fullmatch(r"\d{5}", str(zip_code).strip()):
-        log.warning("[fetch_live_prices] CP ausente/no válido; se omite la consulta.")
+        log.warning(
+            "[fetch_live_prices] CP ausente/no válido; "
+            "se omite la consulta."
+        )
         return []
+
     zip_code = str(zip_code).strip()
     results = []
 
-    opencesta_stores = [s for s in stores if norm(s).replace(" ", "") in STORE_TO_CHAIN]
+    # Fuentes OpenCesta.
+    opencesta_stores = [
+        store
+        for store in stores
+        if norm(store).replace(" ", "") in STORE_TO_CHAIN
+    ]
+
     if opencesta_stores:
         try:
-            log.info("[OpenCesta] '%s' | tiendas=%s | CP=%s", query, opencesta_stores, zip_code)
-            results.extend(search_opencesta(query, opencesta_stores, zip_code))
-        except requests.RequestException as exc:
-            log.error("[OpenCesta] Error HTTP consultando la release: %s", exc)
-        except Exception as exc:
-            log.error("[OpenCesta] No se pudo consultar el dataset: %s", exc)
+            log.info(
+                "[OpenCesta] '%s' | tiendas=%s | CP=%s",
+                query,
+                opencesta_stores,
+                zip_code,
+            )
 
-    web_stores = [s for s in stores if norm(s) in {"alcampo", "carrefour", "lidl"}]
+            results.extend(
+                search_opencesta(
+                    query,
+                    opencesta_stores,
+                    zip_code,
+                )
+            )
+
+        except requests.RequestException as exc:
+            log.error(
+                "[OpenCesta] Error HTTP consultando la release: %s",
+                exc,
+            )
+
+        except Exception as exc:
+            log.error(
+                "[OpenCesta] No se pudo consultar el dataset: %s",
+                exc,
+            )
+
+    # Catálogos web públicos.
+    web_stores = [
+        store
+        for store in stores
+        if norm(store) in {
+            "alcampo",
+            "carrefour",
+            "lidl",
+            "eroski",
+        }
+    ]
+
     if web_stores:
         try:
             from price_sources.web_catalog import search_public_catalog
-            results.extend(search_public_catalog(query, web_stores, zip_code))
-        except Exception:
-            log.exception("[Catálogos web] Error consultando los comercios.")
 
-    log.info("[fetch_live_prices] '%s': %s precios verificados recuperados", query, len(results))
+            results.extend(
+                search_public_catalog(
+                    query,
+                    web_stores,
+                    zip_code,
+                )
+            )
+
+        except Exception:
+            log.exception(
+                "[Catálogos web] Error consultando los comercios."
+            )
+
+    log.info(
+        "[fetch_live_prices] '%s': %s precios recuperados",
+        query,
+        len(results),
+    )
+
     return results
 
 

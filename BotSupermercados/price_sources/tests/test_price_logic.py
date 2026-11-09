@@ -29,6 +29,78 @@ class ShoppingComparisonTests(unittest.TestCase):
         result = compare_shopping_list(["huevos"], ["DIA", "Alcampo"], queried)
         self.assertIsNone(result["best_total"])
 
+    def test_does_not_declare_basket_winner_with_different_package_sizes(self):
+        queried = [
+            {
+                "query": "leche",
+                "prices": [
+                    {
+                        "supermarket": "A",
+                        "name": "Leche entera",
+                        "canonical_key": "leche_entera",
+                        "package_size": "1l",
+                        "unit_price": 1.0,
+                        "unit": "l",
+                        "pack_price": 1.0,
+                    },
+                    {
+                        "supermarket": "B",
+                        "name": "Leche entera",
+                        "canonical_key": "leche_entera",
+                        "package_size": "1.5l",
+                        "unit_price": 0.8,
+                        "unit": "l",
+                        "pack_price": 1.2,
+                    },
+                ],
+            }
+        ]
+
+        result = compare_shopping_list(
+            ["leche"],
+            ["A", "B"],
+            queried,
+        )
+
+        self.assertIsNone(result["best_total"])
+        self.assertFalse(result["basket_comparable"])
+
+    def test_declares_basket_winner_with_equivalent_products_and_sizes(self):
+        queried = [
+            {
+                "query": "leche",
+                "prices": [
+                    {
+                        "supermarket": "A",
+                        "name": "Leche entera",
+                        "canonical_key": "leche_entera",
+                        "package_size": "1l",
+                        "unit_price": 1.0,
+                        "unit": "l",
+                        "pack_price": 1.0,
+                    },
+                    {
+                        "supermarket": "B",
+                        "name": "Leche entera",
+                        "canonical_key": "leche_entera",
+                        "package_size": "1l",
+                        "unit_price": 0.9,
+                        "unit": "l",
+                        "pack_price": 0.9,
+                    },
+                ],
+            }
+        ]
+
+        result = compare_shopping_list(
+            ["leche"],
+            ["A", "B"],
+            queried,
+        )
+
+        self.assertEqual(result["best_total"], "B")
+        self.assertTrue(result["basket_comparable"])
+
 
 class JsonLdConnectorTests(unittest.TestCase):
     def test_extracts_only_real_product_offer_prices(self):

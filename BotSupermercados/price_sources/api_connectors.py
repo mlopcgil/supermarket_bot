@@ -274,37 +274,82 @@ def _load_dataset(force=False):
 _ZONE_CACHE: dict[str, str | None] = {}
 
 def _postal_zone(cp: str) -> str | None:
-    """Resuelve el CP con el comando oficial de OpenCesta, sin inferir provincias."""
+    """Resuelve el CP mediante el CLI de OpenCesta."""
     if cp in _ZONE_CACHE:
         return _ZONE_CACHE[cp]
+
     executable = os.getenv("OPENCESTA_CLI", "opencesta")
+
     try:
         resolved_executable = shutil.which(executable) or executable
+
         result = subprocess.run(
             [executable, "zone", cp],
-            capture_output=True, text=True, timeout=12, check=False,
+            capture_output=True,
+            text=True,
+            timeout=12,
+            check=False,
         )
+
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
-        output = stdout + "\n" + stderr
-        # Ejemplo documentado: `28001 -> mad3`.
-        match = re.search(r"(?:->|→)\s*([a-z0-9_-]+)", output, re.IGNORECASE)
-        if result.returncode == 0 and match:
-            _ZONE_CACHE[cp] = match.group(1).lower()
-            log.info(
-                "[OpenCesta][Diagnóstico zona] ejecutable=%s | CP=%s | returncode=%s | zona=%s | stdout=%r",
-                resolved_executable, cp, result.returncode, _ZONE_CACHE[cp], stdout[:500],
+
+        zone = None
+
+        if result.returncode == 0:
+            # Formato: 28045 -> mad3
+            match = re.search(
+                r"(?:->|→)\s*([a-z0-9_-]+)",
+                stdout,
+                re.IGNORECASE,
             )
-            return _ZONE_CACHE[cp]
+
+            if match:
+                zone = match.group(1).lower()
+            else:
+                # Formato que devuelve tu CLI: mad3
+                match = re.fullmatch(
+                    r"\s*([a-z][a-z0-9_-]*)\s*",
+                    stdout,
+                    re.IGNORECASE,
+                )
+
+                if match:
+                    zone = match.group(1).lower()
+
+        if zone:
+            _ZONE_CACHE[cp] = zone
+
+            log.info(
+                "[OpenCesta] CP %s -> zona %s",
+                cp,
+                zone,
+            )
+
+            return zone
+
         log.warning(
-            "[OpenCesta][Diagnóstico zona] No se pudo resolver CP=%s | ejecutable=%s | "
-            "returncode=%s | stdout=%r | stderr=%r",
-            cp, resolved_executable, result.returncode, stdout[:500], stderr[:500],
+            "[OpenCesta] No se pudo resolver CP=%s | "
+            "ejecutable=%s | returncode=%s | stdout=%r | stderr=%r",
+            cp,
+            resolved_executable,
+            result.returncode,
+            stdout[:500],
+            stderr[:500],
         )
-    except FileNotFoundError as exc:
-        log.warning("[OpenCesta][Diagnóstico zona] CLI no encontrado (%s): %s", executable, exc)
+
+    except FileNotFoundError:
+        log.warning(
+            "[OpenCesta] No se encuentra el ejecutable %s",
+            executable,
+        )
+
     except subprocess.TimeoutExpired:
-        log.warning("[OpenCesta][Diagnóstico zona] Timeout resolviendo CP=%s con %s.", cp, executable)
+        log.warning(
+            "[OpenCesta] Timeout resolviendo CP=%s",
+            cp,
+        )
+
     _ZONE_CACHE[cp] = None
     return None
 
@@ -396,6 +441,33 @@ def _score(query: str, name: str) -> int:
             score += 1
     return score
 
+def _package_size(row: dict) -> str | None:
+    """Construye el tamaño del envase usando los campos de OpenCesta."""
+
+    value = _first(
+        row,
+        "package_size",
+        "pack_size",
+        "size",
+        "net_content",
+    )
+
+    if value is not None:
+        return str(value).strip()
+
+    unit_size = _positive_number(
+        _first(row, "unit_size")
+    )
+
+    size_format = _first(
+        row,
+        "size_format",
+    )
+
+    if unit_size is not None and size_format is not None:
+        return f"{unit_size:g} {str(size_format).strip()}"
+
+    return None
 
 def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]:
     tag, df = _load_dataset()
@@ -477,13 +549,20 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
             product_url = _first(row, "product_url", "url", "share_url", default="https://github.com/ruvelro/opencesta")
             brand = _first(row, "brand")
             product_id = _first(row, "product_id", "sku", "id")
+            ean = _first(row, "ean")
+
+            canonical_key = (
+                f"ean:{str(ean).strip()}"
+                if ean is not None and str(ean).strip()
+                else None
+            )
             results.append({
                 "supermarket": store_name,
                 "name": name,
                 "normalized_name": norm(name),
                 "price": pack_price,
                 "pack_price": pack_price,
-                "package_size": str(_first(row, "package_size", "pack_size", "size", "net_content")) if _first(row, "package_size", "pack_size", "size", "net_content") is not None else None,
+                "package_size": _package_size(row),
                 "unit_price": comparable_price,
                 "unit": comparison_unit,
                 "product_url": str(product_url),
@@ -504,6 +583,8 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
                     "requested_postal_code": zip_code,
                 },
                 "_match_score": int(row.get("_score", 0)),
+                "canonical_key": canonical_key,
+                "ean": str(ean) if ean is not None else None,
             })
     return results
 

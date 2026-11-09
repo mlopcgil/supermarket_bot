@@ -447,6 +447,17 @@ def _search_lidl(query: str, postal_code: str) -> list[dict]:
             timeout=TIMEOUT,
         )
 
+        if response.status_code == 400:
+            _BLOCKED_UNTIL[supermarket] = time.time() + 900
+
+            log.warning(
+                "[Lidl] HTTP 400. La petición no es válida. "
+                "Respuesta: %s",
+                response.text[:300],
+            )
+
+            return []
+
         if response.status_code in (403, 429):
             _BLOCKED_UNTIL[supermarket] = time.time() + 900
 

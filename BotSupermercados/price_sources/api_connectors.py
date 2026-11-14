@@ -417,59 +417,102 @@ def _count_from_name(name: Any) -> float | None:
     return None
 
 
-def _reference_price(row: dict, pack_price: float):
+
+def _reference_price(row: dict, pack_price: float, query: str | None = None):
     """
     Devuelve precio y unidad base homogénea.
-    Usa unidades del dataset o cantidades explícitas en el nombre del envase.
-    No infiere gramos/unidades que el catálogo no publique.
+
+    En búsquedas de huevos:
+    - Prioriza €/unidad si el nombre indica el número de huevos.
+    - No convierte €/kg a €/unidad si no conoce el número de huevos.
+
+    Para el resto de productos utiliza las unidades publicadas.
     """
-    ref_price = _positive_number(_first(row, "reference_price", "price_per_unit"))
+    ref_price = _positive_number(
+        _first(row, "reference_price", "price_per_unit")
+    )
     ref_format = _first(row, "reference_format", "reference_unit")
     ref_unit = _reference_unit(ref_format)
-    size = _positive_number(_first(row, "unit_size"))
-    size_format = norm(_first(row, "size_format", default="")).replace(" ", "")
-    name = _first(row, "display_name", "name", "product_name", "title", default="")
 
-    count_units = {"ud", "uds", "u", "unidad", "unidades", "unit", "units", "c62"}
+    size = _positive_number(_first(row, "unit_size"))
+    size_format = norm(
+        _first(row, "size_format", default="")
+    ).replace(" ", "")
+
+    name = _first(
+        row, "display_name", "name", "product_name", "title",
+        default=""
+    )
+
+    is_egg_query = bool(
+        re.search(r"\bhuevos?\b", norm(query or ""))
+    )
+
+    count_from_name = _count_from_name(name)
+
+    count_units = {
+        "ud", "uds", "u", "unidad", "unidades",
+        "unit", "units", "c62"
+    }
     dozen_units = {"docena", "docenas", "dozen"}
 
-    # Si el Parquet no informa el tamaño, aceptar solo recuentos explícitos
-    # como "pack 4" o "12 unidades" presentes en el nombre del producto.
+    # En huevos, un número explícito de unidades tiene prioridad
+    # sobre un precio por kg publicado para el producto.
+    if is_egg_query and count_from_name:
+        return round(pack_price / count_from_name, 4), "unidad"
+
+    # Si el tamaño no está publicado, solo utilizamos cantidades
+    # explícitas en el nombre del producto.
     if size is None:
-        size = _count_from_name(name)
+        size = count_from_name
         if size is not None:
             size_format = "ud"
 
-    # Si se conoce el número de unidades, priorizar €/unidad en todas las cadenas.
     if size is not None and size_format in count_units:
         return round(pack_price / size, 4), "unidad"
+
     if size is not None and size_format in dozen_units:
         return round(pack_price / (size * 12), 4), "unidad"
 
     if ref_price is not None and ref_unit:
         if ref_unit == "100g":
             return round(ref_price * 10, 4), "kg"
+
         if ref_unit == "100ml":
             return round(ref_price * 10, 4), "l"
+
         if ref_unit == "docena":
             return round(ref_price / 12, 4), "unidad"
+
         return ref_price, ref_unit
 
     if size is None:
         return None, None
+
     if size_format in {"g", "gram", "gramo", "gramos"}:
         return round(pack_price / (size / 1000), 4), "kg"
-    if size_format in {"kg", "k", "kilogram", "kilogramo", "kilogramos"}:
+
+    if size_format in {
+        "kg", "k", "kilogram", "kilogramo", "kilogramos"
+    }:
         return round(pack_price / size, 4), "kg"
-    if size_format in {"ml", "milliliter", "millilitre", "mililitro", "mililitros"}:
+
+    if size_format in {
+        "ml", "milliliter", "millilitre", "mililitro", "mililitros"
+    }:
         return round(pack_price / (size / 1000), 4), "l"
+
     if size_format in {"l", "lt", "ltr", "litro", "litros"}:
         return round(pack_price / size, 4), "l"
+
     if size_format in count_units:
         return round(pack_price / size, 4), "unidad"
+
     if size_format in dozen_units:
         return round(pack_price / (size * 12), 4), "unidad"
+
     return None, None
+
 
 
 def _location_metadata(chain: str, zone: str | None, fallback: bool, zip_code: str):
@@ -595,7 +638,7 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
         if subset.empty:
             continue
         sort_cols = ["_score"] + (["captured_at"] if "captured_at" in subset.columns else [])
-        subset = subset.sort_values(sort_cols, ascending=[False] + ([False] if len(sort_cols) > 1 else [])).head(15)
+        subset = subset.sort_values(sort_cols, ascending=[False] + ([False] if len(sort_cols) > 1 else [])).head(50)
 
         if chain == "ahorramas":
             log.info(
@@ -626,7 +669,29 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
                 continue
             ref_price = _positive_number(_first(row, "reference_price", "price_per_unit"))
             ref_format = _first(row, "reference_format", "reference_unit")
-            comparable_price, comparison_unit = _reference_price(row, pack_price)
+            
+            comparable_price, comparison_unit = _reference_price(
+                row,
+                pack_price,
+                query=query,
+            )
+
+            # Para huevos no comparamos precios por kg.
+            # Solo admitimos €/unidad cuando el número de huevos es conocido.
+            if re.search(r"\bhuevos?\b", norm(query)):
+                if comparison_unit != "unidad":
+                    comparable_price = None
+                    comparison_unit = None
+
+            count_from_name = _count_from_name(name)
+
+            package_size = _package_size(row)
+
+            # En huevos, el número explícito de unidades es el formato
+            # que debe utilizarse para identificar el envase.
+            if count_from_name and re.search(r"\bhuevos?\b", norm(query)):
+                package_size = f"{count_from_name:g} unidades"
+
             captured_at, date_estimated = _date(
                 _first(row, "captured_at", "date", "snapshot_date"), tag
             )
@@ -644,7 +709,7 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
                 "normalized_name": norm(name),
                 "price": pack_price,
                 "pack_price": pack_price,
-                "package_size": _package_size(row),
+                "package_size": package_size,
                 "unit_price": comparable_price,
                 "unit": comparison_unit,
                 "product_url": str(product_url),

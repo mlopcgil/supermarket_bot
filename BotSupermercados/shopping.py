@@ -88,14 +88,30 @@ def compare_shopping_list(items, stores, queried):
 
         for store, candidates in by_store.items():
             # Se conserva el candidato con mejor coincidencia y fecha.
+            
+            # Primero ordenamos por fecha, de más reciente a más antiguo.
             candidates.sort(
-                key=lambda p: (
-                    p.get("_match_score", 0),
-                    _date_key(p.get("captured_at")),
-                ),
+                key=lambda p: _date_key(p.get("captured_at")),
                 reverse=True,
             )
+
+            # La coincidencia con la búsqueda tiene prioridad.
+            # A igualdad de coincidencia, preferimos productos con precio
+            # de referencia y menor coste por unidad homogénea.
+            candidates.sort(
+                key=lambda p: (
+                    -int(p.get("_match_score", 0) or 0),
+                    p.get("unit_price") is None,
+                    (
+                        float(p["unit_price"])
+                        if p.get("unit_price") is not None
+                        else float("inf")
+                    ),
+                )
+            )
+
             store_prices[store] = candidates[0]
+
 
         # Comparación por precio de referencia normalizado (€/kg, €/l o €/unidad).
         # Permite comparar marcas y tamaños de envase distintos sin afirmar que
@@ -289,6 +305,13 @@ def format_comparison(result):
 
             if raw_data.get("date_estimated"):
                 age += " (estimada)"
+
+            # Mostrar el nombre exacto del producto seleccionado.
+            product_name = product.get("name")
+            if product_name:
+                lines.append(
+                    f"      Referencia: {product_name}"
+                )
 
             location_label = raw_data.get("location_label")
             source = product.get("source") or "fuente no identificada"

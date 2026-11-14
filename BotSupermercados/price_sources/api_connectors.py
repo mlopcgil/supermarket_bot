@@ -551,6 +551,27 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
         sort_cols = ["_score"] + (["captured_at"] if "captured_at" in subset.columns else [])
         subset = subset.sort_values(sort_cols, ascending=[False] + ([False] if len(sort_cols) > 1 else [])).head(15)
 
+        if chain == "ahorramas":
+            log.info(
+                "[Ahorramás][Unidades] consulta=%s\n%s",
+                query,
+                subset[
+                    [
+                        c for c in [
+                            "display_name",
+                            "unit_price",
+                            "reference_price",
+                            "reference_format",
+                            "unit_size",
+                            "size_format",
+                            "sku",
+                            "ean",
+                        ]
+                        if c in subset.columns
+                    ]
+                ].head(10).to_string(index=False),
+            )
+
         store_name = CHAIN_TO_STORE.get(chain, requested)
         for row in subset.to_dict("records"):
             name = str(_first(row, name_col, default=""))

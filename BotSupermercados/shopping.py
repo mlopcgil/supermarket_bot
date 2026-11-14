@@ -41,12 +41,28 @@ def _package_signature(product):
             return None
         product_id = ("name", name)
 
-    package_size = normalize(product.get("package_size") or "")
-    unit = normalize(product.get("unit") or "")
+    raw_size = str(product.get("package_size") or "").strip().lower()
+    match = re.search(
+        r"([0-9]+(?:[.,][0-9]+)?)\s*(kg|g|l|ml|ud|uds|unidad|unidades)",
+        raw_size,
+    )
+    if match:
+        amount = float(match.group(1).replace(",", "."))
+        size_unit = match.group(2)
+        if size_unit == "kg":
+            package_size = f"{amount * 1000:g}g"
+        elif size_unit == "l":
+            package_size = f"{amount * 1000:g}ml"
+        elif size_unit in {"ud", "uds", "unidad", "unidades"}:
+            package_size = f"{amount:g}unidad"
+        else:
+            package_size = f"{amount:g}{size_unit}"
+    else:
+        package_size = normalize(raw_size)
 
+    unit = normalize(product.get("unit") or "")
     if not package_size or not unit:
         return None
-
     return product_id, package_size, unit
 
 
@@ -81,78 +97,34 @@ def compare_shopping_list(items, stores, queried):
             )
             store_prices[store] = candidates[0]
 
-        # Comparación individual por unidad de referencia.
-        #
-        # No exigimos que canonical_key o el nombre sean idénticos.
-        # Si dos productos tienen precio por la misma unidad (kg, l,
-        # unidad...), podemos comparar su precio de referencia.
-        #
-        # La comparación se considera orientativa porque no garantiza
-        # que las referencias comerciales sean exactamente iguales.
-
+        # Comparación por precio de referencia normalizado (€/kg, €/l o €/unidad).
+        # Permite comparar marcas y tamaños de envase distintos sin afirmar que
+        # se trata del mismo SKU.
         candidates = {
             store: product
             for store, product in store_prices.items()
             if product.get("unit_price") is not None
             and product.get("unit")
-            and product.get("_match_score", 1) > 0
+            and float(product.get("_match_score", 0) or 0) > 0
         }
-
         groups = defaultdict(dict)
-
         for store, product in candidates.items():
-            unit = normalize(product.get("unit"))
+            groups[str(product.get("unit")).strip().lower()][store] = product
 
-            if not unit:
-                continue
-
-            groups[unit][store] = product
-
-        valid_groups = {
-            unit: products
-            for unit, products in groups.items()
-            if len(products) >= 2
-        }
-
-        if valid_groups:
-            comparison_unit, comparable = max(
-                valid_groups.items(),
-                key=lambda item: (
-                    len(item[1]),
-                    sum(
-                        p.get("_match_score", 0)
-                        for p in item[1].values()
-                    ),
-                ),
-            )
-        else:
-            comparison_unit = None
-            comparable = {}
-
-        can_compare = len(comparable) >= 2
-
+        comparable = max(groups.values(), key=len) if groups else {}
+        units = {str(p["unit"]).strip().lower() for p in comparable.values()}
+        can_compare = len(comparable) >= 2 and len(units) == 1
         cheapest = (
-            min(
-                comparable,
-                key=lambda store: comparable[store]["unit_price"],
-            )
-            if can_compare
-            else None
+            min(comparable, key=lambda store: comparable[store]["unit_price"])
+            if can_compare else None
         )
-
         unit_values = (
-            [
-                p["unit_price"]
-                for p in comparable.values()
-            ]
-            if can_compare
-            else []
+            [float(p["unit_price"]) for p in comparable.values()]
+            if can_compare else []
         )
-
         savings = (
             round(max(unit_values) - min(unit_values), 2)
-            if len(unit_values) >= 2
-            else None
+            if len(unit_values) >= 2 else None
         )
 
         output.append({
@@ -160,9 +132,16 @@ def compare_shopping_list(items, stores, queried):
             "store_prices": store_prices,
             "cheapest": cheapest,
             "savings": savings,
-            "comparison_unit": comparison_unit,
-            "comparable_stores": list(comparable.keys()),
-            "comparison_orientative": True,
+            "comparison_unit": next(iter(units)) if can_compare else None,
+            "comparison_method": "precio_referencia" if can_compare else None,
+            "comparison_is_exact_product": bool(
+                can_compare and len({
+                    (p.get("canonical_key") or normalize(
+                        p.get("normalized_name") or p.get("name") or ""
+                    ), normalize(p.get("package_size") or ""))
+                    for p in comparable.values()
+                }) == 1
+            ),
         })
 
     # Totales de envases encontrados por supermercado.
@@ -352,9 +331,13 @@ def format_comparison(result):
         if item["cheapest"]:
             lines.append(
                 f"  Más barato por {item['comparison_unit']}: "
-                f"*{item['cheapest']}* "
-                "(comparación por precio de referencia)"
+                f"*{item['cheapest']}* (precio de referencia)"
             )
+            if not item.get("comparison_is_exact_product"):
+                lines.append(
+                    "  Comparación por unidad normalizada; pueden variar "
+                    "la marca, referencia o tamaño del envase."
+                )
         else:
             lines.append(
                 "  No comparo un ganador: faltan precios de referencia "

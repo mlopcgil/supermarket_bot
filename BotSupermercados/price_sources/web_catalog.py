@@ -50,6 +50,8 @@ LIDL_SEARCH_URL = os.getenv(
     "LIDL_SEARCH_URL",
     "https://www.lidl.es/q/api/search",
 )
+# El endpoint rechaza peticiones sin un surtido válido. No se inventa uno.
+LIDL_ASSORTMENT = os.getenv("LIDL_ASSORTMENT", "").strip()
 
 SESSION = requests.Session()
 
@@ -440,30 +442,34 @@ def _search_lidl(query: str, postal_code: str) -> list[dict]:
         log.info("[Lidl] Conector pausado temporalmente.")
         return []
 
+    if not LIDL_ASSORTMENT:
+        log.warning(
+            "[Lidl] Consulta omitida: falta LIDL_ASSORTMENT. "
+            "No se envía assortment=null."
+        )
+        return []
+
     try:
         response = SESSION.get(
             LIDL_SEARCH_URL,
-            params={"query": query},
+            params={"query": query, "assortment": LIDL_ASSORTMENT},
             timeout=TIMEOUT,
         )
 
-        if response.status_code == 400:
-            _BLOCKED_UNTIL[supermarket] = time.time() + 900
-
-            log.warning(
-                "[Lidl] HTTP 400. La petición no es válida. "
-                "Respuesta: %s",
-                response.text[:300],
-            )
-
-            return []
-
         if response.status_code in (403, 429):
             _BLOCKED_UNTIL[supermarket] = time.time() + 900
-
             log.warning(
                 "[Lidl] HTTP %s; se pausa el conector 15 minutos.",
                 response.status_code,
+            )
+            return []
+
+        if response.status_code == 400:
+            _BLOCKED_UNTIL[supermarket] = time.time() + 3600
+            log.warning(
+                "[Lidl] HTTP 400; petición no válida. Se pausa una hora. "
+                "Respuesta: %s",
+                (response.text or "")[:300],
             )
             return []
 

@@ -274,82 +274,39 @@ def _load_dataset(force=False):
 _ZONE_CACHE: dict[str, str | None] = {}
 
 def _postal_zone(cp: str) -> str | None:
-    """Resuelve el CP mediante el CLI de OpenCesta."""
+    """Resuelve el CP con el comando oficial de OpenCesta, sin inferir provincias."""
     if cp in _ZONE_CACHE:
         return _ZONE_CACHE[cp]
-
     executable = os.getenv("OPENCESTA_CLI", "opencesta")
-
     try:
         resolved_executable = shutil.which(executable) or executable
-
         result = subprocess.run(
             [executable, "zone", cp],
-            capture_output=True,
-            text=True,
-            timeout=12,
-            check=False,
+            capture_output=True, text=True, timeout=12, check=False,
         )
-
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
-
-        zone = None
-
-        if result.returncode == 0:
-            # Formato: 28045 -> mad3
-            match = re.search(
-                r"(?:->|→)\s*([a-z0-9_-]+)",
-                stdout,
-                re.IGNORECASE,
-            )
-
-            if match:
-                zone = match.group(1).lower()
-            else:
-                # Formato que devuelve tu CLI: mad3
-                match = re.fullmatch(
-                    r"\s*([a-z][a-z0-9_-]*)\s*",
-                    stdout,
-                    re.IGNORECASE,
-                )
-
-                if match:
-                    zone = match.group(1).lower()
-
-        if zone:
-            _ZONE_CACHE[cp] = zone
-
+        output = stdout + "\n" + stderr
+        # Ejemplo documentado: `28001 -> mad3`.
+        match = re.search(r"(?:->|→)\s*([a-z0-9_-]+)", output, re.IGNORECASE)
+        if not match and result.returncode == 0:
+            match = re.fullmatch(r"\s*([a-z][a-z0-9_-]*)\s*", stdout, re.IGNORECASE)
+        if result.returncode == 0 and match:
+            _ZONE_CACHE[cp] = match.group(1).lower()
             log.info(
-                "[OpenCesta] CP %s -> zona %s",
-                cp,
-                zone,
+                "[OpenCesta][Diagnóstico zona] ejecutable=%s | CP=%s | returncode=%s | zona=%s | stdout=%r",
+                resolved_executable, cp, result.returncode, _ZONE_CACHE[cp], stdout[:500],
             )
-
-            return zone
-
+            return _ZONE_CACHE[cp]
         log.warning(
-            "[OpenCesta] No se pudo resolver CP=%s | "
-            "ejecutable=%s | returncode=%s | stdout=%r | stderr=%r",
-            cp,
-            resolved_executable,
-            result.returncode,
-            stdout[:500],
-            stderr[:500],
+            "[OpenCesta][Diagnóstico zona] No se pudo resolver CP=%s | ejecutable=%s | "
+            "returncode=%s | stdout=%r | stderr=%r",
+            cp, resolved_executable, result.returncode, stdout[:500], stderr[:500],
         )
-
-    except FileNotFoundError:
-        log.warning(
-            "[OpenCesta] No se encuentra el ejecutable %s",
-            executable,
-        )
-
+    except FileNotFoundError as exc:
+        log.warning("[OpenCesta][Diagnóstico zona] CLI no encontrado (%s): %s", executable, exc)
     except subprocess.TimeoutExpired:
-        log.warning(
-            "[OpenCesta] Timeout resolviendo CP=%s",
-            cp,
-        )
-
+        log.warning("[OpenCesta][Diagnóstico zona] Timeout resolviendo CP=%s con %s.", cp, executable)
     _ZONE_CACHE[cp] = None
     return None
 
@@ -405,17 +362,21 @@ def _madrid_fallback_zone(zones: set[str], requested_zone: str | None) -> str | 
 
 
 def _reference_unit(value) -> str | None:
-    """Normaliza unidades de precio de referencia para comparar magnitudes equivalentes."""
+    """Normaliza unidades publicadas por OpenCesta."""
     if value is None or pd.isna(value):
         return None
     raw = norm(value).replace(" ", "")
-    if any(token in raw for token in ("kg", "kilo", "kilogramo")):
-        return "kg"
-    if any(token in raw for token in ("100g", "100gram")):
+    if any(x in raw for x in ("100g", "100gram")):
         return "100g"
-    if any(token in raw for token in ("litro", "litros", "/l", "eur/l", "€/l")):
+    if any(x in raw for x in ("100ml", "100millil")):
+        return "100ml"
+    if any(x in raw for x in ("docena", "dozen", "/12")):
+        return "docena"
+    if any(x in raw for x in ("kg", "kilo", "kilogram", "1000g")):
+        return "kg"
+    if any(x in raw for x in ("litro", "litros", "/l", "eur/l", "ltr", "ltq")):
         return "l"
-    if any(token in raw for token in ("unidad", "ud", "/u", "unit")):
+    if any(x in raw for x in ("unidad", "unidades", "ud", "/u", "unit", "c62")):
         return "unidad"
     return None
 
@@ -426,6 +387,93 @@ def _positive_number(value):
         return number if number > 0 else None
     except (TypeError, ValueError):
         return None
+
+
+def _package_size(row: dict):
+    """Obtiene el tamaño del envase de las columnas del dataset."""
+    value = _first(row, "package_size", "pack_size", "net_content")
+    if value is not None:
+        return str(value).strip()
+    size = _positive_number(_first(row, "unit_size"))
+    fmt = _first(row, "size_format")
+    if size is not None and fmt is not None:
+        return f"{size:g} {str(fmt).strip()}"
+    return None
+
+
+def _reference_price(row: dict, pack_price: float):
+    """
+    Devuelve precio y unidad base homogénea.
+    Los productos vendidos por unidades (por ejemplo, huevos) se comparan
+    en €/unidad si el dataset publica el número de unidades del envase.
+    """
+    ref_price = _positive_number(_first(row, "reference_price", "price_per_unit"))
+    ref_format = _first(row, "reference_format", "reference_unit")
+    ref_unit = _reference_unit(ref_format)
+    size = _positive_number(_first(row, "unit_size"))
+    size_format = norm(_first(row, "size_format", default="")).replace(" ", "")
+
+    count_units = {"ud", "uds", "u", "unidad", "unidades", "unit", "units", "c62"}
+    dozen_units = {"docena", "docenas", "dozen"}
+
+    # Si se conoce el número de unidades, priorizar €/unidad en todas las cadenas.
+    if size is not None and size_format in count_units:
+        return round(pack_price / size, 4), "unidad"
+    if size is not None and size_format in dozen_units:
+        return round(pack_price / (size * 12), 4), "unidad"
+
+    if ref_price is not None and ref_unit:
+        if ref_unit == "100g":
+            return round(ref_price * 10, 4), "kg"
+        if ref_unit == "100ml":
+            return round(ref_price * 10, 4), "l"
+        if ref_unit == "docena":
+            return round(ref_price / 12, 4), "unidad"
+        return ref_price, ref_unit
+
+    if size is None:
+        return None, None
+    if size_format in {"g", "gram", "gramo", "gramos"}:
+        return round(pack_price / (size / 1000), 4), "kg"
+    if size_format in {"kg", "k", "kilogram", "kilogramo", "kilogramos"}:
+        return round(pack_price / size, 4), "kg"
+    if size_format in {"ml", "milliliter", "millilitre", "mililitro", "mililitros"}:
+        return round(pack_price / (size / 1000), 4), "l"
+    if size_format in {"l", "lt", "ltr", "litro", "litros"}:
+        return round(pack_price / size, 4), "l"
+    if size_format in count_units:
+        return round(pack_price / size, 4), "unidad"
+    if size_format in dozen_units:
+        return round(pack_price / (size * 12), 4), "unidad"
+    return None, None
+
+
+def _location_metadata(chain: str, zone: str | None, fallback: bool, zip_code: str):
+    """Metadatos geográficos independientes para cada cadena."""
+    if chain == "mercadona":
+        if fallback:
+            return {
+                "location_scope": "regional_zone_approximate",
+                "location_label": f"Madrid ({zone}; zona aproximada para CP {zip_code})",
+            }
+        return {
+            "location_scope": "postal_zone_resolved",
+            "location_label": f"Zona {zone} (resuelta para el CP)",
+        }
+    if chain == "dia":
+        return {
+            "location_scope": "national_default_zone",
+            "location_label": "España (zona general; no específica del CP)",
+        }
+    if chain == "ahorramas":
+        return {
+            "location_scope": "regional_zone_unverified_postal",
+            "location_label": "Madrid (zona regional; no verificada para el CP exacto)",
+        }
+    return {
+        "location_scope": "regional_or_unknown",
+        "location_label": f"Zona {zone}" if zone else None,
+    }
 
 
 def _score(query: str, name: str) -> int:
@@ -441,33 +489,6 @@ def _score(query: str, name: str) -> int:
             score += 1
     return score
 
-def _package_size(row: dict) -> str | None:
-    """Construye el tamaño del envase usando los campos de OpenCesta."""
-
-    value = _first(
-        row,
-        "package_size",
-        "pack_size",
-        "size",
-        "net_content",
-    )
-
-    if value is not None:
-        return str(value).strip()
-
-    unit_size = _positive_number(
-        _first(row, "unit_size")
-    )
-
-    size_format = _first(
-        row,
-        "size_format",
-    )
-
-    if unit_size is not None and size_format is not None:
-        return f"{unit_size:g} {str(size_format).strip()}"
-
-    return None
 
 def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]:
     tag, df = _load_dataset()
@@ -538,23 +559,17 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
                 continue
             ref_price = _positive_number(_first(row, "reference_price", "price_per_unit"))
             ref_format = _first(row, "reference_format", "reference_unit")
-            comparison_unit = _reference_unit(ref_format) if ref_price is not None else None
-            # unit_price solo contiene un precio comparable por unidad de medida.
-            # Si OpenCesta no publica referencia, se conserva el precio del envase
-            # pero no se usa para proclamar un ganador entre formatos desconocidos.
-            comparable_price = ref_price if comparison_unit else None
+            comparable_price, comparison_unit = _reference_price(row, pack_price)
             captured_at, date_estimated = _date(
                 _first(row, "captured_at", "date", "snapshot_date"), tag
             )
             product_url = _first(row, "product_url", "url", "share_url", default="https://github.com/ruvelro/opencesta")
             brand = _first(row, "brand")
             product_id = _first(row, "product_id", "sku", "id")
-            ean = _first(row, "ean")
-
-            canonical_key = (
-                f"ean:{str(ean).strip()}"
-                if ean is not None and str(ean).strip()
-                else None
+            ean = _first(row, "ean", "gtin", "gtin13")
+            location = _location_metadata(
+                chain, selected_zone or _first(row, "zone"),
+                location_fallback, zip_code,
             )
             results.append({
                 "supermarket": store_name,
@@ -572,19 +587,19 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
                 # Dataset por zona/región; no simular que es una tarifa exacta del CP.
                 "postal_code": None,
                 "source_product_id": str(product_id) if product_id is not None else None,
+                "canonical_key": f"ean:{str(ean).strip()}" if ean is not None else None,
                 "raw_data": {
                     "zone": selected_zone or _first(row, "zone"),
                     "location_fallback": location_fallback,
-                    "location_label": "Madrid (zona aproximada)" if location_fallback else None,
+                    **location,
                     "date_estimated": date_estimated,
                     "reference_price": ref_price,
                     "reference_format": ref_format,
                     "comparison_unit": comparison_unit,
+                    "reference_price_calculated": ref_price is None and comparable_price is not None,
                     "requested_postal_code": zip_code,
                 },
                 "_match_score": int(row.get("_score", 0)),
-                "canonical_key": canonical_key,
-                "ean": str(ean) if ean is not None else None,
             })
     return results
 

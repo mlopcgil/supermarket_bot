@@ -291,10 +291,23 @@ def format_comparison(result):
                 age += " (estimada)"
 
             location_label = raw_data.get("location_label")
+            source = product.get("source") or "fuente no identificada"
 
+            if pack_price is not None:
+                lines.append(
+                    f"  • *{store}*: envase *{pack_price:.2f} €* "
+                    f"— dato {age} — fuente: {source}"
+                )
+            else:
+                lines.append(
+                    f"  • *{store}*: precio de envase no disponible "
+                    f"— dato {age} — fuente: {source}"
+                )
+
+            # La ubicación se imprime debajo del supermercado al que pertenece.
             if location_label:
                 lines.append(
-                    f"      Ubicación del precio: {location_label}; "
+                    f"      Ubicación: {location_label}; "
                     "no es una tarifa exacta de tu CP."
                 )
             elif raw_data.get(
@@ -303,19 +316,6 @@ def format_comparison(result):
                 lines.append(
                     "      Precio observado en la web; la tienda/zona "
                     "de entrega no ha podido verificarse."
-                )
-
-            source = product.get("source") or "fuente no identificada"
-
-            if pack_price is not None:
-                lines.append(
-                    f"  • {store}: envase *{pack_price:.2f} €* "
-                    f"— dato {age} — fuente: {source}"
-                )
-            else:
-                lines.append(
-                    f"  • {store}: precio de envase no disponible "
-                    f"— dato {age} — fuente: {source}"
                 )
 
             if (
@@ -348,6 +348,19 @@ def format_comparison(result):
             lines.append(
                 f"  Diferencia por unidad de referencia: "
                 f"{item['savings']:.2f} €/{item['comparison_unit']}"
+            )
+
+        # Informa cuando hay precios con unidades distintas que no entran
+        # en el grupo comparado (por ejemplo, €/kg frente a €/unidad).
+        known_units = {
+            str(product.get("unit")).strip().lower()
+            for product in item["store_prices"].values()
+            if product.get("unit") and product.get("unit_price") is not None
+        }
+        if len(known_units) > 1:
+            lines.append(
+                "  Algunas tiendas no entran en esta comparación porque "
+                "publican una unidad distinta; no comparo €/kg con €/unidad."
             )
 
     lines.append("\n*Coste total por supermercado (precios de envase)*")

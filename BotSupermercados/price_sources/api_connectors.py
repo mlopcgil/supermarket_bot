@@ -401,20 +401,44 @@ def _package_size(row: dict):
     return None
 
 
+def _count_from_name(name: Any) -> float | None:
+    """Extrae unidades explícitas del nombre; nunca deduce pesos no publicados."""
+    value = norm(name)
+    patterns = (
+        r"\b(?:pack|paquete|bandeja|estuche)\s*(?:de\s*)?(\d{1,2})\b",
+        r"\b(\d{1,2})\s*(?:u|ud|uds|unidad|unidades)\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, value)
+        if match:
+            count = _positive_number(match.group(1))
+            if count and count <= 100:
+                return count
+    return None
+
+
 def _reference_price(row: dict, pack_price: float):
     """
     Devuelve precio y unidad base homogénea.
-    Los productos vendidos por unidades (por ejemplo, huevos) se comparan
-    en €/unidad si el dataset publica el número de unidades del envase.
+    Usa unidades del dataset o cantidades explícitas en el nombre del envase.
+    No infiere gramos/unidades que el catálogo no publique.
     """
     ref_price = _positive_number(_first(row, "reference_price", "price_per_unit"))
     ref_format = _first(row, "reference_format", "reference_unit")
     ref_unit = _reference_unit(ref_format)
     size = _positive_number(_first(row, "unit_size"))
     size_format = norm(_first(row, "size_format", default="")).replace(" ", "")
+    name = _first(row, "display_name", "name", "product_name", "title", default="")
 
     count_units = {"ud", "uds", "u", "unidad", "unidades", "unit", "units", "c62"}
     dozen_units = {"docena", "docenas", "dozen"}
+
+    # Si el Parquet no informa el tamaño, aceptar solo recuentos explícitos
+    # como "pack 4" o "12 unidades" presentes en el nombre del producto.
+    if size is None:
+        size = _count_from_name(name)
+        if size is not None:
+            size_format = "ud"
 
     # Si se conoce el número de unidades, priorizar €/unidad en todas las cadenas.
     if size is not None and size_format in count_units:
@@ -474,6 +498,23 @@ def _location_metadata(chain: str, zone: str | None, fallback: bool, zip_code: s
         "location_scope": "regional_or_unknown",
         "location_label": f"Zona {zone}" if zone else None,
     }
+
+
+def _is_relevant_product(query: str, name: str) -> bool:
+    """Evita falsos positivos evidentes en búsquedas de productos sensibles."""
+    q, n = norm(query), norm(name)
+    if not q or not n:
+        return False
+
+    # En una búsqueda de huevos de consumo, no aceptar huevos de chocolate,
+    # juguetes o productos Kinder Joy.
+    if "huevo" in q or "huevos" in q:
+        if not re.search(r"\bhuevos?\b", n):
+            return False
+        excluded = ("chocolate", "kinder", "sorpresa", "juguete", "relleno")
+        if any(token in n.split() for token in excluded):
+            return False
+    return True
 
 
 def _score(query: str, name: str) -> int:
@@ -543,8 +584,13 @@ def search_opencesta(query: str, stores: list[str], zip_code: str) -> list[dict]
                 selected_zone = "es-default"
                 subset = subset[subset["zone"].astype(str).str.lower() == selected_zone]
 
+        # Filtrar falsos positivos semánticos antes de puntuar y ordenar.
+        subset = subset[
+            subset[name_col].astype(str).map(lambda x: _is_relevant_product(query, x))
+        ]
+        if subset.empty:
+            continue
         subset["_score"] = subset[name_col].astype(str).map(lambda x: _score(query, x))
-        # Evitar falsos positivos: exigir al menos una coincidencia textual.
         subset = subset[subset["_score"] > 0]
         if subset.empty:
             continue

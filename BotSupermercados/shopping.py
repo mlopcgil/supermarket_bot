@@ -117,53 +117,72 @@ def _package_signature(product):
     return product_id, package_size, unit
 
 
+
 def build_product_options(products):
     """
-    Agrupa la misma referencia/formato entre supermercados.
-    Solo agrupa automáticamente cuando la identidad es suficientemente
-    clara; no mezcla productos de nombres o formatos diferentes.
+    Devuelve referencias individuales, sin mezclar supermercados.
+    Elimina duplicados del mismo producto dentro de una tienda.
     """
-    groups = {}
+    unique = {}
 
     for product in products:
-        canonical = (product.get("canonical_key") or "").strip()
         name = normalize(
             product.get("normalized_name") or product.get("name") or ""
         )
-        package = normalize(product.get("package_size") or "")
-        unit = normalize(product.get("unit") or "")
-
-        if canonical:
-            identity = ("canonical", canonical, package, unit)
-        else:
-            identity = ("name", name, package, unit)
-
-        if not name:
+        store = normalize(product.get("supermarket") or "")
+        if not name or not store:
             continue
 
-        if identity not in groups:
-            groups[identity] = {
-                "name": product.get("name") or name,
-                "brand": product.get("brand"),
-                "package_size": product.get("package_size"),
-                "unit": product.get("unit"),
-                "products": [],
-            }
+        # Identidad preferente: SKU o EAN dentro de cada supermercado.
+        sku = str(product.get("sku") or "").strip()
+        ean = str(product.get("ean") or "").strip()
+        source_key = str(product.get("source_key") or "").strip()
 
-        groups[identity]["products"].append(product)
+        if source_key:
+            identity = ("source", store, source_key)
+        elif sku:
+            identity = ("sku", store, sku)
+        elif ean:
+            identity = ("ean", store, ean)
+        else:
+            identity = (
+                "fallback",
+                store,
+                name,
+                normalize(product.get("package_size") or ""),
+                normalize(product.get("unit") or ""),
+                str(product.get("pack_price") or ""),
+            )
 
-    options = list(groups.values())
+        current = unique.get(identity)
 
-    # Las opciones con más supermercados disponibles aparecen primero.
+        # Si hay duplicados, conserva el registro más reciente.
+        if current is None or _date_key(product.get("captured_at")) > _date_key(
+            current.get("captured_at")
+        ):
+            unique[identity] = product
+
+    options = []
+
+    for product in unique.values():
+        options.append({
+            "name": product.get("name") or "Producto sin nombre",
+            "brand": product.get("brand"),
+            "package_size": product.get("package_size"),
+            "unit": product.get("unit"),
+            "supermarket": product.get("supermarket"),
+            "product": product,
+        })
+
     options.sort(
         key=lambda option: (
-            len(option["products"]),
-            option["name"].lower()
-        ),
-        reverse=True
+            normalize(option.get("supermarket") or ""),
+            normalize(option.get("name") or ""),
+        )
     )
 
     return options
+
 
 def compare_shopping_list(items, stores, queried):
     """
@@ -198,8 +217,9 @@ def compare_shopping_list(items, stores, queried):
                 reverse=True,
             )
 
-            # Conservamos todas las referencias disponibles.
-            store_prices[store] = candidates
+            # La selección del usuario ya ha determinado la referencia.
+            # Si hay registros duplicados, conservamos el mejor candidato.
+            store_prices[store] = candidates[0]
 
 
         # Comparación por precio de referencia normalizado (€/kg, €/l o €/unidad).

@@ -209,33 +209,6 @@ def send_long_message(chat_id, message, reply_markup=None):
 OPTIONS_PER_PAGE = 6
 
 
-def option_description(option):
-    """Texto descriptivo de una opción y sus precios disponibles."""
-    name = option.get("name") or "Producto sin nombre"
-    brand = option.get("brand")
-    package = option.get("package_size")
-
-    title = name
-    if brand and normalize_text(brand) not in normalize_text(name):
-        title += f" ({brand})"
-    if package:
-        title += f" - {package}"
-
-    prices = []
-    for product in option["products"]:
-        price = product.get("pack_price")
-        if price is not None:
-            prices.append(
-                f"{product['supermarket']}: {price:.2f} €"
-            )
-        else:
-            prices.append(
-                f"{product['supermarket']}: precio no disponible"
-            )
-
-    return title, ", ".join(prices)
-
-
 def normalize_text(value):
     import unicodedata
     import re
@@ -247,16 +220,40 @@ def normalize_text(value):
     return re.sub(r"[^a-z0-9]+", " ", value).strip()
 
 
+def option_description(option):
+    """Descripción de una referencia concreta de un supermercado."""
+    product = option["product"]
+
+    title = product.get("name") or "Producto sin nombre"
+
+    brand = product.get("brand")
+    if brand and normalize_text(brand) not in normalize_text(title):
+        title += f" ({brand})"
+
+    package = product.get("package_size")
+    if package and normalize_text(package) not in normalize_text(title):
+        title += f" - {package}"
+
+    price = product.get("pack_price")
+
+    if price is not None:
+        price_text = f"{float(price):.2f} €"
+    else:
+        price_text = "precio no disponible"
+
+    return title, price_text
+
+
 def option_keyboard(options, page):
     markup = types.InlineKeyboardMarkup(row_width=1)
 
     start = page * OPTIONS_PER_PAGE
-    end = start + OPTIONS_PER_PAGE
+    end = min(start + OPTIONS_PER_PAGE, len(options))
 
-    for index in range(start, min(end, len(options))):
-        title, _ = option_description(options[index])
-        label = f"Elegir {index + 1}: {title}"
+    for index in range(start, end):
+        title, price = option_description(options[index])
 
+        label = f"{index + 1}. {title} — {price}"
         if len(label) > 60:
             label = label[:57] + "..."
 
@@ -291,67 +288,101 @@ def option_keyboard(options, page):
     return markup
 
 
+def build_selection_tasks(items, stores, queried):
+    """
+    Construye una tarea por cada combinación producto-supermercado.
+    Cada tarea contiene únicamente referencias de esa tienda.
+    """
+    tasks = []
+
+    for item_index, query in enumerate(items):
+        entry = next(
+            (
+                result for result in queried
+                if normalize_text(result.get("query")) == normalize_text(query)
+            ),
+            {"prices": []}
+        )
+
+        all_options = build_product_options(entry.get("prices", []))
+
+        for store in stores:
+            store_options = [
+                option
+                for option in all_options
+                if normalize_text(option.get("supermarket")) ==
+                   normalize_text(store)
+            ]
+
+            tasks.append({
+                "item_index": item_index,
+                "query": query,
+                "store": store,
+                "options": store_options,
+            })
+
+    return tasks
+
+
 def show_current_options(chat_id, uid):
     """
-    Avanza por los productos:
-    - Sin resultados: guarda el producto como no encontrado.
-    - Una opción: la selecciona automáticamente.
-    - Varias opciones: pregunta al usuario.
+    Recorre las tareas producto-supermercado.
+    Si solo existe una referencia, la selecciona automáticamente.
+    Si hay varias, pregunta al usuario.
     """
     state = pending.get(uid)
 
     if not state:
         return
 
-    while state["item_index"] < len(state["items"]):
-        index = state["item_index"]
-        query = state["items"][index]
-        options = state["options_by_item"][index]
+    tasks = state["selection_tasks"]
 
+    while state["task_index"] < len(tasks):
+        task = tasks[state["task_index"]]
+        options = task["options"]
+
+        # No hay referencias para esta tienda.
         if not options:
-            state["selected"].append({
-                "query": query,
-                "prices": []
-            })
-            state["item_index"] += 1
+            state["task_index"] += 1
             continue
 
+        # Solo existe una referencia: selección automática.
         if len(options) == 1:
-            state["selected"].append({
-                "query": query,
-                "prices": options[0]["products"]
-            })
-            state["item_index"] += 1
+            product = options[0]["product"]
+            state["selected_by_item"][task["item_index"]][
+                task["store"]
+            ] = product
+
+            state["task_index"] += 1
             continue
 
-        # Hay varias referencias: el usuario debe elegir.
+        # Hay varias referencias: pregunta al usuario.
         state["current_page"] = 0
-
-        title = (
-            f"🔎 *Elige la referencia para:* {query}\n\n"
-            f"He encontrado {len(options)} opciones.\n"
-            "Selecciona la que corresponda a tu producto:\n\n"
-        )
 
         start = 0
         end = min(OPTIONS_PER_PAGE, len(options))
 
+        message_text = (
+            f"🛒 *Producto:* {task['query']}\n"
+            f"🏪 *Supermercado:* {task['store']}\n\n"
+            f"He encontrado {len(options)} referencias.\n"
+            "Elige una:\n\n"
+        )
+
         for option in options[start:end]:
-            option_title, prices = option_description(option)
-            title += f"• *{option_title}*\n"
-            if prices:
-                title += f"  {prices}\n"
-            title += "\n"
+            title, price = option_description(option)
+            message_text += f"• *{title}*\n"
+            message_text += f"  Precio: {price}\n\n"
 
         bot.send_message(
             chat_id,
-            title,
+            message_text,
             parse_mode="Markdown",
             reply_markup=option_keyboard(options, 0)
         )
         return
 
-    # Ya se han seleccionado todos los productos.
+    # Ya se han procesado todos los supermercados y productos.
     finish_selected_comparison(chat_id, uid)
 
 
@@ -363,7 +394,20 @@ def finish_selected_comparison(chat_id, uid):
 
     items = state["items"]
     stores = state["stores"]
-    selected = state["selected"]
+
+    # Construimos una lista plana de productos:
+    # un diccionario por supermercado y producto.
+    selected = []
+
+    for item_index, query in enumerate(items):
+        selected_prices = list(
+            state["selected_by_item"][item_index].values()
+        )
+
+        selected.append({
+            "query": query,
+            "prices": selected_prices,
+        })
 
     try:
         result = compare_shopping_list(items, stores, selected)
@@ -414,6 +458,7 @@ def finish_selected_comparison(chat_id, uid):
     finally:
         pending.pop(uid, None)
 
+
 @bot.callback_query_handler(
     func=lambda call: (
         call.data.startswith("choose:")
@@ -431,8 +476,15 @@ def product_selection_callback(call):
         )
         return
 
-    index = state["item_index"]
-    options = state["options_by_item"][index]
+    tasks = state["selection_tasks"]
+    task_index = state["task_index"]
+
+    if task_index >= len(tasks):
+        bot.answer_callback_query(call.id, "La selección ha terminado.")
+        return
+
+    task = tasks[task_index]
+    options = task["options"]
 
     if call.data.startswith("page:"):
         page = int(call.data.split(":")[1])
@@ -447,18 +499,17 @@ def product_selection_callback(call):
         start = page * OPTIONS_PER_PAGE
         end = min(start + OPTIONS_PER_PAGE, len(options))
 
-        query = state["items"][index]
         message_text = (
-            f"🔎 *Elige la referencia para:* {query}\n\n"
-            f"Opciones {start + 1}-{end} de {len(options)}:\n\n"
+            f"🛒 *Producto:* {task['query']}\n"
+            f"🏪 *Supermercado:* {task['store']}\n\n"
+            f"Opciones {start + 1}-{end} de {len(options)}.\n"
+            "Elige una:\n\n"
         )
 
         for option in options[start:end]:
-            option_title, prices = option_description(option)
-            message_text += f"• *{option_title}*\n"
-            if prices:
-                message_text += f"  {prices}\n"
-            message_text += "\n"
+            title, price = option_description(option)
+            message_text += f"• *{title}*\n"
+            message_text += f"  Precio: {price}\n\n"
 
         bot.answer_callback_query(call.id)
 
@@ -478,17 +529,18 @@ def product_selection_callback(call):
         return
 
     selected_option = options[selected_index]
+    selected_product = selected_option["product"]
 
-    state["selected"].append({
-        "query": state["items"][index],
-        "prices": selected_option["products"]
-    })
+    # Guardamos la referencia para este producto y esta tienda.
+    state["selected_by_item"][task["item_index"]][
+        task["store"]
+    ] = selected_product
 
-    state["item_index"] += 1
+    state["task_index"] += 1
 
     bot.answer_callback_query(
         call.id,
-        "Referencia seleccionada"
+        f"Referencia de {task['store']} seleccionada"
     )
 
     try:
@@ -501,6 +553,7 @@ def product_selection_callback(call):
         log.warning("No se pudo retirar el teclado de selección")
 
     show_current_options(call.message.chat.id, uid)
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith("extra:") or call.data == "run:")
 def shopping_callback(call):
@@ -537,22 +590,23 @@ def shopping_callback(call):
             stores,
             get_postal_code(uid)
         )
+         
+        # Creamos una tarea por cada producto y supermercado.
+        selection_tasks = build_selection_tasks(
+            items,
+            stores,
+            prices
+        )
 
-        options_by_item = []
-
-        for entry in prices:
-            options = build_product_options(
-                entry.get("prices", [])
-            )
-            options_by_item.append(options)
-
-        # Se inicia el proceso de selección.
         state["mode"] = "selecting_products"
-        state["options_by_item"] = options_by_item
-        state["selected"] = []
-        state["item_index"] = 0
+        state["selection_tasks"] = selection_tasks
+        state["selected_by_item"] = [
+            {} for _ in items
+        ]
+        state["task_index"] = 0
 
         show_current_options(call.message.chat.id, uid)
+
 
     except Exception:
         log.exception("Error preparando opciones de productos")

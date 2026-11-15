@@ -168,6 +168,39 @@ def process_list(message):
         reply_markup=markup
     )
 
+def send_long_message(chat_id, message, reply_markup=None):
+    """Divide mensajes largos para respetar el límite de Telegram."""
+    max_length = 3500
+    chunks = []
+    current_chunk = ""
+
+    for line in message.splitlines(keepends=True):
+        if len(current_chunk) + len(line) > max_length:
+            if current_chunk:
+                chunks.append(current_chunk)
+                current_chunk = ""
+
+            # Si una sola línea supera el límite, también la dividimos.
+            while len(line) > max_length:
+                chunks.append(line[:max_length])
+                line = line[max_length:]
+
+        current_chunk += line
+
+    if current_chunk:
+        chunks.append(current_chunk)
+
+    for i, chunk in enumerate(chunks):
+        is_last = i == len(chunks) - 1
+
+        bot.send_message(
+            chat_id,
+            chunk,
+            disable_web_page_preview=True,
+            parse_mode="Markdown",
+            reply_markup=reply_markup if is_last else None
+        )
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("extra:") or call.data == "run:")
 def shopping_callback(call):
     uid = call.from_user.id
@@ -211,7 +244,11 @@ def shopping_callback(call):
                 "los precios exactos de tu código postal.\n\n"
             )
             text = warning + text
-        bot.send_message(call.message.chat.id, text, disable_web_page_preview=True, parse_mode="Markdown", reply_markup=get_main_keyboard())
+        send_long_message(
+            call.message.chat.id,
+            text,
+            reply_markup=get_main_keyboard()
+        )
     except Exception:
         log.exception("Error comparando lista")
         bot.send_message(call.message.chat.id, "No he podido completar la comparación. Inténtalo de nuevo en unos momentos.", reply_markup=get_main_keyboard())

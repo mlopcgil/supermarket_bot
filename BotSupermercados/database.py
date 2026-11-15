@@ -164,81 +164,170 @@ def save_live_prices(products):
                 p.get("postal_code"), sid, json.dumps(p.get("raw_data") or {}, default=str)
             ))
 
-def get_prices_for_query(items, stores, postal_code=None):
-    """Consulta conectores y recupera solo precios recientes del CP solicitado.
+def _normalize_tokens(text):
+    """Normaliza palabras y plurales sencillos en español."""
+    import unicodedata
+    import re
 
-    Los registros regionales de OpenCesta se aceptan únicamente si se
-    descargaron para ese mismo CP; los datos nacionales deben marcarse de forma
-    explícita con raw_data.region_scope='national'.
+    text = unicodedata.normalize("NFKD", (text or "").lower())
+    text = "".join(
+        c for c in text if not unicodedata.combining(c)
+    )
+    words = re.sub(r"[^a-z0-9]+", " ", text).split()
+
+    stopwords = {
+        "de", "del", "la", "las", "el", "los",
+        "un", "una", "unos", "unas", "con", "y"
+    }
+
+    result = set()
+
+    for word in words:
+        if word in stopwords:
+            continue
+
+        if len(word) > 4 and word.endswith("es"):
+            word = word[:-2]
+        elif len(word) > 3 and word.endswith("s"):
+            word = word[:-1]
+
+        result.add(word)
+
+    return result
+
+
+def get_prices_for_query(items, stores, postal_code=None):
     """
-    if not postal_code or not str(postal_code).strip().isdigit() or len(str(postal_code).strip()) != 5:
+    Recupera todas las referencias relevantes para cada búsqueda.
+    No reduce los resultados a un único producto por supermercado.
+    """
+    if (
+        not postal_code
+        or not str(postal_code).strip().isdigit()
+        or len(str(postal_code).strip()) != 5
+    ):
         return [{"query": item, "prices": []} for item in items]
+
     postal_code = str(postal_code).strip()
 
     try:
         from price_sources.api_connectors import fetch_live_prices
+
         for query in items:
             live_data = fetch_live_prices(query, stores, postal_code)
             if live_data:
                 save_live_prices(live_data)
+
     except Exception:
         import logging
-        logging.getLogger(__name__).exception("Error al obtener datos en vivo")
+        logging.getLogger(__name__).exception(
+            "Error al obtener datos en vivo"
+        )
 
     max_age_days = int(os.getenv("PRICE_MAX_AGE_DAYS", "3"))
-    with db() as conn, conn.cursor(cursor_factory=RealDictCursor) as cur:
+
+    with db() as conn, conn.cursor(
+        cursor_factory=RealDictCursor
+    ) as cur:
         cur.execute("""
-            SELECT p.name, p.normalized_name, p.canonical_key, p.brand, p.package_size,
-                   p.unit_price, p.pack_price, p.unit, p.product_url, p.source, p.captured_at,
-                   p.postal_code, p.raw_data, s.name AS supermarket
-            FROM products p JOIN supermarkets s ON s.id=p.supermarket_id
+            SELECT
+                p.source_key,
+                p.name,
+                p.normalized_name,
+                p.canonical_key,
+                p.brand,
+                p.package_size,
+                p.unit_price,
+                p.pack_price,
+                p.unit,
+                p.product_url,
+                p.source,
+                p.captured_at,
+                p.postal_code,
+                p.raw_data,
+                s.name AS supermarket
+            FROM products p
+            JOIN supermarkets s ON s.id = p.supermarket_id
             WHERE s.name = ANY(%s)
-              AND p.available=TRUE
+              AND p.available = TRUE
               AND p.captured_at >= CURRENT_DATE - %s
               AND (
-                    p.postal_code=%s
-                    OR (p.postal_code IS NULL AND (
-                        p.raw_data->>'requested_postal_code'=%s
-                        OR p.raw_data->>'region_scope'='national'
-                    ))
+                    p.postal_code = %s
+                    OR (
+                        p.postal_code IS NULL
+                        AND (
+                            p.raw_data->>'requested_postal_code' = %s
+                            OR p.raw_data->>'region_scope' = 'national'
+                        )
+                    )
               )
             ORDER BY p.captured_at DESC
         """, (stores, max_age_days, postal_code, postal_code))
+
         rows = cur.fetchall()
 
-    import unicodedata, re
-    def _norm(value):
-        value = unicodedata.normalize("NFKD", (value or "").lower())
-        value = "".join(c for c in value if not unicodedata.combining(c))
-        return re.sub(r"[^a-z0-9]+", " ", value).strip()
-
     result = []
-    for query in items:
-        q = _norm(query)
-        terms = [t for t in q.split() if len(t) > 1]
-        matches = []
-        for row in rows:
-            name_norm = row["normalized_name"] or _norm(row["name"])
-            name_terms = set(name_norm.split())
-            score = sum(1 for term in terms if term in name_terms or (len(term) > 4 and term[:-1] in name_terms))
-            if q and q in name_norm:
-                score += 5
-            if score > 0 and (len(terms) <= 1 or score >= max(1, len(terms) - 1)):
-                item = dict(row)
-                item["unit_price"] = float(item["unit_price"]) if item["unit_price"] is not None else None
-                item["pack_price"] = float(item["pack_price"]) if item["pack_price"] is not None else None
-                item["_match_score"] = score
-                matches.append(item)
 
-        best_by_store = {}
-        for item in matches:
-            store_name = item["supermarket"]
-            current = best_by_store.get(store_name)
-            item_date = item["captured_at"]
-            current_date = current["captured_at"] if current else None
-            if current is None or (item["_match_score"], item_date) > (current["_match_score"], current_date):
-                best_by_store[store_name] = item
-        result.append({"query": query, "prices": list(best_by_store.values())})
+    for query in items:
+        query_tokens = _normalize_tokens(query)
+        matches = []
+        seen = set()
+
+        for row in rows:
+            product = dict(row)
+
+            # Se tienen en cuenta nombre, nombre normalizado,
+            # marca y formato del envase.
+            searchable_text = " ".join([
+                str(product.get("name") or ""),
+                str(product.get("normalized_name") or ""),
+                str(product.get("brand") or ""),
+                str(product.get("package_size") or ""),
+            ])
+
+            product_tokens = _normalize_tokens(searchable_text)
+
+            # Todos los términos significativos de la búsqueda
+            # deben aparecer en el producto.
+            if not query_tokens.issubset(product_tokens):
+                continue
+
+            source_key = product.get("source_key")
+
+            if source_key and source_key in seen:
+                continue
+
+            if source_key:
+                seen.add(source_key)
+
+            product["unit_price"] = (
+                float(product["unit_price"])
+                if product["unit_price"] is not None
+                else None
+            )
+            product["pack_price"] = (
+                float(product["pack_price"])
+                if product["pack_price"] is not None
+                else None
+            )
+
+            product["_match_score"] = len(query_tokens)
+            matches.append(product)
+
+        # Se ordenan las coincidencias, pero no se descarta ninguna.
+        matches.sort(
+            key=lambda p: (
+                p.get("_match_score", 0),
+                p.get("captured_at")
+            ),
+            reverse=True
+        )
+
+        result.append({
+            "query": query,
+            "prices": matches
+        })
+
     return result
 
 def save_session(telegram_id, items, stores, result):

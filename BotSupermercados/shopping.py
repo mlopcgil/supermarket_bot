@@ -8,6 +8,57 @@ def normalize(text):
     text = "".join(c for c in text if not unicodedata.combining(c))
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", text)).strip()
 
+def _tokens(text):
+    """
+    Normaliza palabras y elimina plurales sencillos en español.
+    Ejemplos:
+      yogures -> yogur
+      desnatados -> desnatado
+      manzanas -> manzana
+    """
+    words = normalize(text).split()
+    result = set()
+
+    for word in words:
+        if len(word) > 4 and word.endswith("es"):
+            word = word[:-2]
+        elif len(word) > 3 and word.endswith("s"):
+            word = word[:-1]
+
+        result.add(word)
+
+    return result
+
+
+def product_matches_query(query, product):
+    """
+    Comprueba que el producto contiene todos los términos
+    relevantes de la búsqueda del usuario.
+    """
+    query_tokens = _tokens(query)
+
+    product_text = " ".join([
+        str(product.get("name") or ""),
+        str(product.get("normalized_name") or ""),
+        str(product.get("brand") or ""),
+    ])
+
+    product_tokens = _tokens(product_text)
+
+    return query_tokens.issubset(product_tokens)
+
+
+def filter_relevant_products(query, products):
+    """
+    Devuelve únicamente productos que contienen todos
+    los términos especificados en la búsqueda.
+    """
+    return [
+        product
+        for product in products
+        if product_matches_query(query, product)
+    ]
+
 
 def parse_list(text):
     parts = re.split(r"[,;\n]+", text or "")
@@ -66,6 +117,54 @@ def _package_signature(product):
     return product_id, package_size, unit
 
 
+def build_product_options(products):
+    """
+    Agrupa la misma referencia/formato entre supermercados.
+    Solo agrupa automáticamente cuando la identidad es suficientemente
+    clara; no mezcla productos de nombres o formatos diferentes.
+    """
+    groups = {}
+
+    for product in products:
+        canonical = (product.get("canonical_key") or "").strip()
+        name = normalize(
+            product.get("normalized_name") or product.get("name") or ""
+        )
+        package = normalize(product.get("package_size") or "")
+        unit = normalize(product.get("unit") or "")
+
+        if canonical:
+            identity = ("canonical", canonical, package, unit)
+        else:
+            identity = ("name", name, package, unit)
+
+        if not name:
+            continue
+
+        if identity not in groups:
+            groups[identity] = {
+                "name": product.get("name") or name,
+                "brand": product.get("brand"),
+                "package_size": product.get("package_size"),
+                "unit": product.get("unit"),
+                "products": [],
+            }
+
+        groups[identity]["products"].append(product)
+
+    options = list(groups.values())
+
+    # Las opciones con más supermercados disponibles aparecen primero.
+    options.sort(
+        key=lambda option: (
+            len(option["products"]),
+            option["name"].lower()
+        ),
+        reverse=True
+    )
+
+    return options
+
 def compare_shopping_list(items, stores, queried):
     """
     Compara precios por unidad homogénea y calcula los totales de envase.
@@ -87,30 +186,20 @@ def compare_shopping_list(items, stores, queried):
         store_prices = {}
 
         for store, candidates in by_store.items():
-            # Se conserva el candidato con mejor coincidencia y fecha.
-            
-            # Primero ordenamos por fecha, de más reciente a más antiguo.
+            # Primero priorizamos la fecha más reciente.
             candidates.sort(
                 key=lambda p: _date_key(p.get("captured_at")),
                 reverse=True,
             )
 
-            # La coincidencia con la búsqueda tiene prioridad.
-            # A igualdad de coincidencia, preferimos productos con precio
-            # de referencia y menor coste por unidad homogénea.
+            # Después priorizamos la coincidencia y fecha
             candidates.sort(
-                key=lambda p: (
-                    -int(p.get("_match_score", 0) or 0),
-                    p.get("unit_price") is None,
-                    (
-                        float(p["unit_price"])
-                        if p.get("unit_price") is not None
-                        else float("inf")
-                    ),
-                )
+                key=lambda p: int(p.get("_match_score", 0) or 0),
+                reverse=True,
             )
 
-            store_prices[store] = candidates[0]
+            # Conservamos todas las referencias disponibles.
+            store_prices[store] = candidates
 
 
         # Comparación por precio de referencia normalizado (€/kg, €/l o €/unidad).
@@ -394,7 +483,8 @@ def format_comparison(result):
     ):
         if data["found"] == result["item_count"]:
             lines.append(
-                f"  • {store}: *{data['total']:.2f} €* (lista completa)"
+                f"  • {store}: *{data['total']:.2f} €* "
+                f"(precios encontrados para todos los productos)"
             )
         elif data["found"]:
             lines.append(

@@ -117,56 +117,83 @@ def _package_signature(product):
     return product_id, package_size, unit
 
 
+def _dedup_text(value):
+    value = str(value or "").strip().lower()
+    value = unicodedata.normalize("NFKD", value)
+    value = "".join(
+        c for c in value
+        if not unicodedata.combining(c)
+    )
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return " ".join(value.split())
 
-def build_product_options(products):
+
+def _dedup_price(product):
+    price = product.get("pack_price")
+
+    if price is None:
+        price = product.get("price")
+
+    if price is None:
+        return None
+
+    try:
+        return round(float(price), 2)
+    except (TypeError, ValueError):
+        return str(price)
+
+
+def deduplicate_products(products):
     """
-    Devuelve referencias individuales, sin mezclar supermercados.
-    Elimina duplicados del mismo producto dentro de una tienda.
+    Elimina registros repetidos del mismo producto en una tienda.
+    Conserva el registro más reciente.
     """
     unique = {}
 
     for product in products:
-        name = normalize(
-            product.get("normalized_name") or product.get("name") or ""
+        store = _dedup_text(
+            product.get("supermarket") or product.get("store")
         )
-        store = normalize(product.get("supermarket") or "")
-        if not name or not store:
+        name = _dedup_text(
+            product.get("normalized_name") or product.get("name")
+        )
+
+        if not store or not name:
             continue
 
-        # Identidad preferente: SKU o EAN dentro de cada supermercado.
-        sku = str(product.get("sku") or "").strip()
-        ean = str(product.get("ean") or "").strip()
-        source_key = str(product.get("source_key") or "").strip()
-
-        if source_key:
-            identity = ("source", store, source_key)
-        elif sku:
-            identity = ("sku", store, sku)
-        elif ean:
-            identity = ("ean", store, ean)
-        else:
-            identity = (
-                "fallback",
-                store,
-                name,
-                normalize(product.get("package_size") or ""),
-                normalize(product.get("unit") or ""),
-                str(product.get("pack_price") or ""),
-            )
+        identity = (
+            store,
+            name,
+            _dedup_text(product.get("brand")),
+            _dedup_text(product.get("package_size")),
+            _dedup_text(product.get("unit")),
+            _dedup_price(product),
+        )
 
         current = unique.get(identity)
 
-        # Si hay duplicados, conserva el registro más reciente.
-        if current is None or _date_key(product.get("captured_at")) > _date_key(
-            current.get("captured_at")
+        if (
+            current is None
+            or _date_key(product.get("captured_at"))
+            > _date_key(current.get("captured_at"))
         ):
             unique[identity] = product
 
+    return list(unique.values())
+
+def build_product_options(products):
+    """
+    Devuelve referencias individuales, sin mezclar supermercados.
+    """
+    products = deduplicate_products(products)
+
     options = []
 
-    for product in unique.values():
+    for product in products:
+        name = product.get("name") or "Producto sin nombre"
+
         options.append({
-            "name": product.get("name") or "Producto sin nombre",
+            "name": name,
             "brand": product.get("brand"),
             "package_size": product.get("package_size"),
             "unit": product.get("unit"),
@@ -178,6 +205,7 @@ def build_product_options(products):
         key=lambda option: (
             normalize(option.get("supermarket") or ""),
             normalize(option.get("name") or ""),
+            normalize(option.get("package_size") or ""),
         )
     )
 

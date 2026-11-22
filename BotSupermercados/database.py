@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from contextlib import contextmanager
 import psycopg2
 from psycopg2.extras import RealDictCursor, execute_values
+from shopping import deduplicate_products
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -271,7 +272,6 @@ def get_prices_for_query(items, stores, postal_code=None):
     for query in items:
         query_tokens = _normalize_tokens(query)
         matches = []
-        seen = set()
 
         for row in rows:
             product = dict(row)
@@ -292,14 +292,6 @@ def get_prices_for_query(items, stores, postal_code=None):
             if not query_tokens.issubset(product_tokens):
                 continue
 
-            source_key = product.get("source_key")
-
-            if source_key and source_key in seen:
-                continue
-
-            if source_key:
-                seen.add(source_key)
-
             product["unit_price"] = (
                 float(product["unit_price"])
                 if product["unit_price"] is not None
@@ -313,6 +305,8 @@ def get_prices_for_query(items, stores, postal_code=None):
 
             product["_match_score"] = len(query_tokens)
             matches.append(product)
+
+        matches = deduplicate_products(matches)
 
         # Se ordenan las coincidencias, pero no se descarta ninguna.
         matches.sort(
